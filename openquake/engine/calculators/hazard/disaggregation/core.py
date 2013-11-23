@@ -23,7 +23,7 @@ import openquake.hazardlib
 from openquake.engine import logs
 from openquake.engine.calculators.hazard import general as haz_general
 from openquake.engine.calculators.hazard.classical.core import \
-    compute_hazard_curves
+    ClassicalHazardCalculator
 from openquake.engine.db import models
 from openquake.engine.input import logictree
 from openquake.engine.utils import general as general_utils
@@ -219,7 +219,7 @@ def _save_disagg_matrix(job, site, bin_edges, diss_matrix, lt_rlz,
     )
 
 
-class DisaggHazardCalculator(haz_general.BaseHazardCalculator):
+class DisaggHazardCalculator(ClassicalHazardCalculator):
     """
     A calculator which performs disaggregation calculations in a distributed /
     parallelized fashion.
@@ -227,38 +227,6 @@ class DisaggHazardCalculator(haz_general.BaseHazardCalculator):
     See :func:`openquake.hazardlib.calc.disagg.disaggregation` for more
     details about the nature of this type of calculation.
     """
-    core_calc_task = compute_hazard_curves
-
-    def pre_execute(self):
-        """
-        Do pre-execution work. At the moment, this work entails:
-        parsing and initializing sources, parsing and initializing the
-        site model (if there is one), parsing vulnerability and
-        exposure files, and generating logic tree realizations. (The
-        latter piece basically defines the work to be done in the
-        `execute` phase.)
-        """
-
-        # Parse risk models.
-        self.parse_risk_models()
-
-        # Deal with the site model and compute site data for the calculation
-        # (if a site model was specified, that is).
-        self.initialize_site_model()
-
-        # Parse logic trees and create source Inputs.
-        self.initialize_sources()
-
-        # Now bootstrap the logic tree realizations and related data.
-        # This defines for us the "work" that needs to be done when we reach
-        # the `execute` phase.
-        # This will also stub out hazard curve result records. Workers will
-        # update these periodically with partial results (partial meaning,
-        # result curves for just a subset of the overall sources) when some
-        # work is complete.
-        self.initialize_realizations(
-            rlz_callbacks=[self.initialize_hazard_curve_progress])
-
     def disagg_task_arg_gen(self, block_size):
         """
         Generate task args for the second phase of disaggregation calculations.
@@ -284,24 +252,8 @@ class DisaggHazardCalculator(haz_general.BaseHazardCalculator):
 
     def post_execute(self):
         """
-        Finalize the hazard curves computed in the execute phase
-        and start the disaggregation phase.
+        Start the disaggregation phase after the hazard curves generation
         """
-        self.finalize_hazard_curves()
+        super(DisaggHazardCalculator, self).post_execute()
         self.parallelize(
             compute_disagg, self.disagg_task_arg_gen(self.block_size()))
-
-    def clean_up(self):
-        """
-        Delete temporary database records.
-        These records represent intermediate copies of final calculation
-        results and are no longer needed.
-
-        In this case, this includes all of the data for this calculation in the
-        tables found in the `htemp` schema space.
-        """
-        self.sources_per_rlz.clear()
-        logs.LOG.debug('> cleaning up temporary DB data')
-        models.HazardCurveProgress.objects.filter(
-            lt_realization__hazard_calculation=self.hc.id).delete()
-        logs.LOG.debug('< done cleaning up temporary DB data')

@@ -40,78 +40,6 @@ from django.db import transaction
 RUPTURE_BLOCK_SIZE = 1000
 
 
-@utils_tasks.oqtask
-def compute_hazard_curves(job_id, src_ids, lt_rlz_id, ltp):
-    """
-    Celery task for hazard curve calculator.
-
-    Samples logic trees, gathers site parameters, and calls the hazard curve
-    calculator.
-
-    Once hazard curve data is computed, result progress updated (within a
-    transaction, to prevent race conditions) in the
-    `htemp.hazard_curve_progress` table.
-
-    :param int job_id:
-        ID of the currently running job.
-    :param src_ids:
-        List of ids of parsed source models to take into account.
-    :param lt_rlz_id:
-        Id of logic tree realization model to calculate for.
-    :param ltp:
-        a :class:`openquake.engine.input.LogicTreeProcessor` instance
-    """
-    hc = models.HazardCalculation.objects.get(oqjob=job_id)
-
-    lt_rlz = models.LtRealization.objects.get(id=lt_rlz_id)
-
-    apply_uncertainties = ltp.parse_source_model_logictree_path(
-        lt_rlz.sm_lt_path)
-    gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
-
-    parsed_sources = models.ParsedSource.objects.filter(pk__in=src_ids)
-
-    imts = haz_general.im_dict_to_hazardlib(
-        hc.intensity_measure_types_and_levels)
-
-    # Prepare args for the calculator.
-    calc_kwargs = {'gsims': gsims,
-                   'truncation_level': hc.truncation_level,
-                   'time_span': hc.investigation_time,
-                   'sources': [apply_uncertainties(s.nrml)
-                               for s in parsed_sources],
-                   'imts': imts,
-                   'sites': hc.site_collection}
-
-    if hc.maximum_distance:
-        dist = hc.maximum_distance
-        # NB: a better approach could be to filter the sources by distance
-        # at the beginning and to store into the database only the relevant
-        # sources, as we do in the event based calculator: I am not doing that
-        # for the classical calculator because I wonder about the performance
-        # impact in in SHARE-like calculations. So at the moment we store
-        # everything in the database and we filter on the workers. This
-        # will probably change in the future (MS).
-        calc_kwargs['source_site_filter'] = (
-            openquake.hazardlib.calc.filters.source_site_distance_filter(dist))
-        calc_kwargs['rupture_site_filter'] = (
-            openquake.hazardlib.calc.filters.rupture_site_distance_filter(
-                dist))
-
-    # mapping "imt" to 2d array of hazard curves: first dimension -- sites,
-    # second -- IMLs
-    with EnginePerformanceMonitor(
-            'computing hazard curves', job_id,
-            compute_hazard_curves, tracing=True):
-        matrices = openquake.hazardlib.calc.hazard_curve.\
-            hazard_curves_poissonian(**calc_kwargs)
-
-    with EnginePerformanceMonitor(
-            'saving hazard curves', job_id,
-            compute_hazard_curves, tracing=True):
-        _update_curves(hc, matrices, lt_rlz)
-
-
 def _update_curves(hc, matrices, lt_rlz):
     """
     Helper function for updating source, hazard curve, and realization progress
@@ -153,95 +81,6 @@ def _update_curves(hc, matrices, lt_rlz):
 
                     logs.LOG.debug('< done updating hazard for IMT=%s' % imt)
 
-'''
-class ClassicalHazardCalculatorOld(haz_general.BaseHazardCalculator):
-    """
-    Classical PSHA hazard calculator. Computes hazard curves for a given set of
-    points.
-
-    For each realization of the calculation, we randomly sample source models
-    and GMPEs (Ground Motion Prediction Equations) from logic trees.
-    """
-
-    core_calc_task = compute_hazard_curves
-
-    def pre_execute(self):
-        """
-        Do pre-execution work. At the moment, this work entails:
-        parsing and initializing sources, parsing and initializing the
-        site model (if there is one), parsing vulnerability and
-        exposure files and generating logic tree realizations. (The
-        latter piece basically defines the work to be done in the
-        `execute` phase.).
-        """
-
-        # Parse vulnerability and exposure model
-        self.parse_risk_models()
-
-        # Deal with the site model and compute site data for the calculation
-        # (if a site model was specified, that is).
-        self.initialize_site_model()
-
-        # Parse logic trees and create source Inputs.
-        self.initialize_sources()
-
-        # Now bootstrap the logic tree realizations and related data.
-        # This defines for us the "work" that needs to be done when we reach
-        # the `execute` phase.
-        # This will also stub out hazard curve result records. Workers will
-        # update these periodically with partial results (partial meaning,
-        # result curves for just a subset of the overall sources) when some
-        # work is complete.
-        self.initialize_realizations(
-            rlz_callbacks=[self.initialize_hazard_curve_progress])
-
-    def post_execute(self):
-        """
-        Post-execution actions. At the moment, all we do is finalize the hazard
-        curve results. See
-        :meth:`openquake.engine.calculators.hazard.general.\
-BaseHazardCalculator.finalize_hazard_curves`
-        for more info.
-        """
-        self.finalize_hazard_curves()
-
-    def clean_up(self):
-        """
-        Delete temporary database records.
-        These records represent intermediate copies of final calculation
-        results and are no longer needed.
-
-        In this case, this includes all of the data for this calculation in the
-        tables found in the `htemp` schema space.
-        """
-        self.sources_per_rlz.clear()
-        logs.LOG.debug('> cleaning up temporary DB data')
-        models.HazardCurveProgress.objects.filter(
-            lt_realization__hazard_calculation=self.hc.id).delete()
-        logs.LOG.debug('< done cleaning up temporary DB data')
-
-    def post_process(self):
-        logs.LOG.debug('> starting post processing')
-
-        # means/quantiles:
-        if self.hc.mean_hazard_curves or self.hc.quantile_hazard_curves:
-            self.do_aggregate_post_proc()
-
-        # hazard maps:
-        # required for computing UHS
-        # if `hazard_maps` is false but `uniform_hazard_spectra` is true,
-        # just don't export the maps
-        if self.hc.hazard_maps or self.hc.uniform_hazard_spectra:
-            self.parallelize(
-                post_proc.hazard_curves_to_hazard_map_task,
-                post_proc.hazard_curves_to_hazard_map_task_arg_gen(self.job))
-
-        if self.hc.uniform_hazard_spectra:
-            post_proc.do_uhs_post_proc(self.job)
-
-        logs.LOG.debug('< done with post processing')
-'''
-
 
 def update_result_matrix(current, new):
     """
@@ -264,8 +103,6 @@ def update_result_matrix(current, new):
     """
     return 1 - (1 - current) * (1 - new)
 
-
-########################### NEW IMPLEMENTATION ############################
 
 @utils_tasks.oqtask
 def generate_ruptures(job_id, src_ids, lt_rlz, ltp):
@@ -333,6 +170,7 @@ def generate_hazard_curves(job_id, rupture_ids, imts, gsims, lt_rlz):
     """
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
+    imts = haz_general.im_dict_to_hazardlib(imts)  # hazardlib imts are not pickleable!
     total_sites = len(hc.site_collection)
     f = openquake.hazardlib.calc.filters
     rupture_site_filter = (
@@ -416,13 +254,12 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
 
     def generate_curves_arg_gen(self):
         ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
-        imts = haz_general.im_dict_to_hazardlib(
-            self.hc.intensity_measure_types_and_levels)
+        imts = self.hc.intensity_measure_types_and_levels
         for lt_rlz in self._get_realizations():
             gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
-            rupture_ids = models.SESRupture.objects.filter(
+            rupture_ids = list(models.SESRupture.objects.filter(
                 ses__ses_collection__lt_realization=lt_rlz
-            ).values_list('id', flat=True)
+            ).values_list('id', flat=True))
             if not rupture_ids:
                 continue
             for rids in block_splitter(rupture_ids, RUPTURE_BLOCK_SIZE):
