@@ -35,7 +35,7 @@ class ClassicalHazardCase2TestCase(qa_utils.BaseQATestCase):
       <gml:Point>
         <gml:pos>0.0 0.0</gml:pos>
       </gml:Point>
-      <poEs>0.00994026570298 0.000753551720765 9.69007927378e-05 0.0</poEs>
+      <poEs>0.00994026570298 0.000753551720766 9.69007927376e-05 0.0</poEs>
     </hazardCurve>
   </hazardCurves>
 </nrml>
@@ -62,6 +62,6 @@ class ClassicalHazardCase2TestCase(qa_utils.BaseQATestCase):
             exported_file = hazard_export.export(
                 actual_curve.hazard_curve.output.id, result_dir)
             self.assert_xml_equal(
-                 StringIO.StringIO(self.EXPECTED_XML), exported_file)
+                StringIO.StringIO(self.EXPECTED_XML), exported_file)
         finally:
             shutil.rmtree(result_dir)

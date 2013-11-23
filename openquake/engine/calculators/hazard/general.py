@@ -28,12 +28,9 @@ import numpy
 
 # FIXME: one must import the engine before django to set DJANGO_SETTINGS_MODULE
 from openquake.engine.db import models
-
 from django.db import transaction, connections
-from shapely import geometry
 
 from openquake.hazardlib import correlation
-from openquake.hazardlib import geo as hazardlib_geo
 from openquake.nrmllib import parsers as nrml_parsers
 from openquake.nrmllib.risk import parsers
 
@@ -185,8 +182,8 @@ class BaseHazardCalculator(base.Calculator):
         Loop through realizations and sources to generate a sequence of
         task arg tuples. Each tuple of args applies to a single task.
 
-        For this default implementation, yielded results are triples of
-        (job_id, realization_id, source_id_list).
+        For this default implementation, yielded results are tuples of
+        (job_id, realization_id, source_id_list, logic_tree_processor).
 
         Override this in subclasses as necessary.
 
@@ -208,14 +205,14 @@ class BaseHazardCalculator(base.Calculator):
             point_source_ids = self.sources_per_rlz[lt_rlz.id, 'point']
             for block in block_splitter(point_source_ids,
                                         point_source_block_size):
-                task_args = (self.job.id, block, lt_rlz.id, ltp)
+                task_args = (self.job.id, block, lt_rlz, ltp)
                 yield task_args
                 n += 1
 
             # now for area and fault sources
             other_source_ids = self.sources_per_rlz[lt_rlz.id, 'other']
             for block in block_splitter(other_source_ids, block_size):
-                task_args = (self.job.id, block, lt_rlz.id, ltp)
+                task_args = (self.job.id, block, lt_rlz, ltp)
                 yield task_args
                 n += 1
 
@@ -314,12 +311,11 @@ class BaseHazardCalculator(base.Calculator):
     @EnginePerformanceMonitor.monitor
     def initialize_sources(self):
         """
-        Parse and validation source logic trees. Save the parsed
+        Parse and validate source logic trees. Save the parsed
         sources to the `parsed_source` table (see
         :class:`openquake.engine.db.models.ParsedSource`).
         """
         logs.LOG.progress("initializing sources")
-
         for src_path in logictree.read_logic_trees(self.hc):
             source.SourceDBWriter(
                 self.job,

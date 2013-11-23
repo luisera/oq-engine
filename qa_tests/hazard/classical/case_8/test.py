@@ -83,9 +83,9 @@ class ClassicalHazardCase8TestCase(qa_utils.BaseQATestCase):
 
             # Test the poe values for the three curves:
             curve_b1_b2, curve_b1_b3, curve_b1_b4 = \
-                models.HazardCurveData.objects\
-                    .filter(hazard_curve__output__oq_job=job.id)\
-                    .order_by('hazard_curve__lt_realization__sm_lt_path')
+                models.HazardCurveData.objects.filter(
+                    hazard_curve__output__oq_job=job.id).order_by(
+                    'hazard_curve__lt_realization__sm_lt_path')
 
             # Sanity check, to make sure we have the curves ordered correctly:
             self.assertEqual(

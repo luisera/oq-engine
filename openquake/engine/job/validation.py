@@ -54,7 +54,7 @@ def validate(job, job_type, params, exports):
     try:
         form_class = globals()[formname]
     except KeyError:
-        return 'Could not find form class for "%s"' % calc_mode
+        return 'Could not find form class %s for "%s"' % (formname, calc_mode)
 
     files = set(params['inputs'])
     form = form_class(instance=calculation, files=files, exports=exports)
