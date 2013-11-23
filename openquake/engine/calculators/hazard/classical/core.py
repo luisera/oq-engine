@@ -35,26 +35,6 @@ from django.db import transaction
 
 
 @utils_tasks.oqtask
-def hazard_curves(job_id, src_ids, lt_rlz_id, ltp):
-    """
-    A celery task wrapper function around :func:`compute_hazard_curves`.
-    See :func:`compute_hazard_curves` for parameter definitions.
-
-    :param ltp:
-        a :class:`openquake.engine.input.LogicTreeProcessor` instance
-    """
-    logs.LOG.debug('> starting task: job_id=%s, lt_realization_id=%s'
-                   % (job_id, lt_rlz_id))
-
-    compute_hazard_curves(job_id, src_ids, lt_rlz_id, ltp)
-    # Last thing, signal back the control node to indicate the completion of
-    # task. The control node needs this to manage the task distribution and
-    # keep track of progress.
-    logs.LOG.debug('< task complete, signalling completion')
-
-
-# Silencing 'Too many local variables'
-# pylint: disable=R0914
 def compute_hazard_curves(job_id, src_ids, lt_rlz_id, ltp):
     """
     Celery task for hazard curve calculator.
@@ -115,12 +95,14 @@ def compute_hazard_curves(job_id, src_ids, lt_rlz_id, ltp):
     # mapping "imt" to 2d array of hazard curves: first dimension -- sites,
     # second -- IMLs
     with EnginePerformanceMonitor(
-            'computing hazard curves', job_id, hazard_curves, tracing=True):
+            'computing hazard curves', job_id,
+            compute_hazard_curves, tracing=True):
         matrices = openquake.hazardlib.calc.hazard_curve.\
             hazard_curves_poissonian(**calc_kwargs)
 
     with EnginePerformanceMonitor(
-            'saving hazard curves', job_id, hazard_curves, tracing=True):
+            'saving hazard curves', job_id,
+            compute_hazard_curves, tracing=True):
         _update_curves(hc, matrices, lt_rlz, src_ids)
 
 
@@ -177,7 +159,7 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
     and GMPEs (Ground Motion Prediction Equations) from logic trees.
     """
 
-    core_calc_task = hazard_curves
+    core_calc_task = compute_hazard_curves
 
     def pre_execute(self):
         """
