@@ -165,28 +165,50 @@ def generate_ruptures(job_id, src_ids, lt_rlz, ltp):
                 r.save()
 
 
+def rupture_sites_filter(hc, rupture_ids):
+    """
+    """
+    cursor = models.getcursor('job_init')
+    query = '''\
+SELECT rup.id, rup.tag, array_agg(hsite.id) AS site_ids
+    FROM hzrdr.ses_rupture AS rup
+    JOIN hzrdi.hazard_site AS hsite
+    ON ST_DWithin(rup.hypocenter, hsite.location, %s)
+    WHERE hsite.hazard_calculation_id = %s AND rup.id IN ({})
+GROUP BY rup.id, rup.tag ORDER BY rup.tag;
+'''.format(','.join(map(str, rupture_ids)))
+    KM_TO_MT = 1000
+    cursor.execute(query, (hc.maximum_distance * KM_TO_MT, hc.id))
+    for rup_id, rup_tag, site_ids in cursor:
+        sids = set(site_ids)
+        sitecoll = hc.site_collection.filter(
+            numpy.array([s.id in sids for s in hc.site_collection]))
+        yield models.SESRupture.objects.get(pk=rup_id).rupture, sitecoll
+
+
 @utils_tasks.oqtask
 def generate_hazard_curves(job_id, rupture_ids, imts, gsims, lt_rlz):
     """
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
-    imts = haz_general.im_dict_to_hazardlib(imts)  # hazardlib imts are not pickleable!
+    # hazardlib imts are not pickleable, hence the line below is needed
+    imts = haz_general.im_dict_to_hazardlib(imts)
     total_sites = len(hc.site_collection)
-    f = openquake.hazardlib.calc.filters
-    rupture_site_filter = (
-        f.rupture_site_distance_filter(hc.maximum_distance)
-        if hc.maximum_distance else f.rupture_site_noop_filter)
 
     with EnginePerformanceMonitor(
-            'reading ruptures', job_id, generate_hazard_curves):
-        rupture_sites = [(r.rupture, hc.site_collection) for r in
-                         models.SESRupture.objects.filter(pk__in=rupture_ids)]
-
+            'filtering ruptures', job_id, generate_hazard_curves):
+        if hc.maximum_distance:  # database filtering
+            rupture_sites = list(rupture_sites_filter(hc, rupture_ids))
+        else:  # no filtering
+            rupture_sites = [
+                (r, hc.site_collection)
+                for r in models.SESRupture.objects.filter(pk__in=rupture_ids)
+            ]
     curves = dict((imt, numpy.ones([total_sites, len(imts[imt])]))
                   for imt in imts)
     with EnginePerformanceMonitor(
             'generating hazard curves', job_id, generate_hazard_curves):
-        for rupture, r_sites in rupture_site_filter(rupture_sites):
+        for rupture, r_sites in rupture_sites:
             prob = rupture.get_probability_one_or_more_occurrences()
             gsim = gsims[rupture.tectonic_region_type]
             sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
