@@ -18,10 +18,9 @@ Core functionality for the classical PSHA hazard calculator.
 """
 import math
 import numpy
+from celery.task import task
 
-import openquake.hazardlib
-import openquake.hazardlib.calc
-import openquake.hazardlib.imt
+from openquake.hazardlib.tom import PoissonTOM
 
 from openquake.engine import writer, logs
 from openquake.engine.calculators.hazard import general as haz_general
@@ -36,30 +35,25 @@ from openquake.engine.utils.general import block_splitter
 from django.db import transaction
 
 
-def hazard_curves_poisson(
-        sources, sites, imts, time_span, gsims, truncation_level,
-        source_site_filter, rupture_site_filter):
-
-    curves = dict((imt, numpy.ones([len(sites), len(imts[imt])]))
-                  for imt in imts)
-    tom = PoissonTOM(time_span)
-
+def hazard_curves(ruptures, sites, imtls, gsims, truncation_level):
+    """
+    """
     total_sites = len(sites)
-    sources_sites = ((source, sites) for source in sources)
-    for source, s_sites in source_site_filter(sources_sites):
-        ruptures_sites = ((rupture, s_sites)
-                          for rupture in source.iter_ruptures(tom))
-        for rupture, r_sites in rupture_site_filter(ruptures_sites):
-            prob = rupture.get_probability_one_or_more_occurrences()
-            gsim = gsims[rupture.tectonic_region_type]
-            sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
-            for imt in imts:
-                poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
-                                     truncation_level)
-                curves[imt] *= r_sites.expand(
-                    (1 - prob) ** poes, total_sites, placeholder=1
-                )
-    return dict((imt, 1 - curves[imt]) for imt in imts)
+    imts = haz_general.im_dict_to_hazardlib(imtls)
+    sorted_imts = sorted(imts)
+    curves = 1. - make_zeros(sites, imtls)
+    for rupture in ruptures:
+        prob = rupture.get_probability_one_or_more_occurrences()
+        gsim = gsims[rupture.tectonic_region_type]
+        sctx, rctx, dctx = gsim.make_contexts(sites, rupture)
+        for i, imt in enumerate(sorted_imts):
+            poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
+                                 truncation_level)
+            curves[i] *= sites.expand(
+                (1 - prob) ** poes, total_sites, placeholder=1)
+    return 1. - curves
+
+hazard_curves_task = task(hazard_curves)
 
 
 @oqtask
@@ -82,39 +76,50 @@ def compute_hazard_curves(job_id, sources, lt_rlz_id, ltp):
     Return a sorted array of arrays, one for each IMT.
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
-
+    imtls = hc.intensity_measure_types_and_levels
     lt_rlz = models.LtRealization.objects.get(id=lt_rlz_id)
-
     apply_uncertainties = ltp.parse_source_model_logictree_path(
         lt_rlz.sm_lt_path)
     gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
-    imts = haz_general.im_dict_to_hazardlib(
-        hc.intensity_measure_types_and_levels)
+    tom = PoissonTOM(hc.investigation_time)
 
-    # Prepare args for the calculator.
-    calc_kwargs = {'gsims': gsims,
-                   'truncation_level': hc.truncation_level,
-                   'time_span': hc.investigation_time,
-                   'sources': map(apply_uncertainties, sources),
-                   'imts': imts,
-                   'sites': hc.site_collection}
-
-    if hc.maximum_distance:
-        dist = hc.maximum_distance
-        if not hc.prefiltering:  # filter the sources in the worker
-            calc_kwargs['source_site_filter'] = openquake.hazardlib.calc.\
-                filters.source_site_distance_filter(dist)
-        #calc_kwargs['rupture_site_filter'] = openquake.hazardlib.calc.\
-        #    filters.rupture_site_distance_filter(dist)
-
-    # mapping "imt" to 2d array of hazard curves: first dimension -- sites,
-    # second -- IMLs
     with EnginePerformanceMonitor(
             'computing hazard curves', job_id,
             compute_hazard_curves, tracing=True):
-        dic = openquake.hazardlib.calc.hazard_curve.hazard_curves_poissonian(
-            **calc_kwargs)
-        return numpy.array([dic[imt] for imt in sorted(imts)])
+        all_args = []
+        ruptures = []
+        for src in map(apply_uncertainties, sources):
+            ruptures.extend(src.iter_ruptures(tom))
+        if not ruptures:
+            return make_zeros(hc.site_collection, imtls)
+        elif len(ruptures) < 1000:
+            logs.LOG.info('Generating hazard curves for %d ruptures',
+                          len(ruptures))
+            return hazard_curves(
+                ruptures, hc.site_collection, imtls, gsims,
+                hc.truncation_level)
+        all_args = [
+            (block, hc.site_collection, imtls, gsims, hc.truncation_level)
+            for block in block_splitter(ruptures, 1000)]
+        logs.LOG.info('Generating %d tasks for %d ruptures',
+                      len(all_args), len(ruptures))
+        return map_reduce(
+            hazard_curves_task, all_args,
+            lambda a, v: 1. - (1. - a) * (1. - v),
+            make_zeros(hc.site_collection, imtls))
+
+
+def make_zeros(sites, imts):
+    """
+    Returns a numpy array of I * S * L zeros, where
+    I is the number of intensity measure types, S the number of sites
+    and L the number of intensity measure levels.
+
+    :params sites: the site collection
+    :param imts: a dictionary of intensity measure types and levels
+    """
+    return numpy.array(
+        [numpy.zeros((len(sites), len(imts[imt]))) for imt in sorted(imts)])
 
 
 class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
@@ -148,13 +153,8 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
         provided by the .task_arg_gen method. By default it uses the
         parallelize distribution, but it can be overridden is subclasses.
         """
-        self.n_sites = len(self.hc.site_collection)
-        self.num_imls = [
-            len(self.hc.intensity_measure_types_and_levels[imt])
-            for imt in sorted(self.hc.intensity_measure_types_and_levels)]
-
         ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
-
+        imtls = self.hc.intensity_measure_types_and_levels
         for lt_rlz in self._get_realizations():
             task_args = []
             sm = self.rlz_to_sm[lt_rlz]  # source model path
@@ -168,9 +168,7 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
             # the following line will print out the number of tasks generated
             self.initialize_percent(self.core_calc_task, task_args)
 
-            zeros = numpy.array(
-                [numpy.zeros((self.n_sites, n_imls))
-                 for n_imls in self.num_imls])
+            zeros = make_zeros(self.hc.site_collection, imtls)
             matrices = map_reduce(
                 self.core_calc_task, task_args, self.aggregate, zeros)
             with transaction.commit_on_success(using='job_init'):

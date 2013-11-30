@@ -685,7 +685,7 @@ class HazardCalculation(djm.Model):
         """
         Prefiltering is enabled when there are few sites (up to a thousand)
         """
-        return len(self.site_collection) <= 1000
+        return self.maximum_distance and len(self.site_collection) <= 1000
 
     @property
     def vulnerability_models(self):
@@ -898,7 +898,7 @@ class HazardCalculation(djm.Model):
 
         :param src: the source object used for the filtering
         """
-        if self.maximum_distance and self.prefiltering:
+        if self.prefiltering:
             return src.filter_sites_by_distance_to_source(
                 self.maximum_distance, self.site_collection)
         return self.site_collection
