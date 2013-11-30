@@ -202,7 +202,7 @@ class BaseHazardCalculator(base.Calculator):
                     self.hc.rupture_mesh_spacing,
                     self.hc.width_of_mfd_bin,
                     self.hc.area_source_discretization)
-                if self.hc.filtered_site_collection(src):
+                if self.hc.close_sites(src):
                     self.sources_per_model[src_path].append(src)
             logs.LOG.info(
                 'found %d relevant sources for model %s',

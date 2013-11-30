@@ -17,8 +17,9 @@
 Core functionality for the classical PSHA hazard calculator.
 """
 import math
+import operator
+
 import numpy
-from celery.task import task
 
 from openquake.hazardlib.tom import PoissonTOM
 
@@ -35,34 +36,35 @@ from openquake.engine.utils.general import block_splitter
 from django.db import transaction
 
 
-def hazard_curves(ruptures, sites, imtls, gsims, truncation_level):
+@oqtask
+def hazard_curves(job_id, ruptures, sites, imtls, gsims, truncation_level):
     """
     """
     total_sites = len(sites)
     imts = haz_general.im_dict_to_hazardlib(imtls)
     sorted_imts = sorted(imts)
-    curves = 1. - make_zeros(sites, imtls)
-    for rupture in ruptures:
-        prob = rupture.get_probability_one_or_more_occurrences()
-        gsim = gsims[rupture.tectonic_region_type]
-        sctx, rctx, dctx = gsim.make_contexts(sites, rupture)
-        for i, imt in enumerate(sorted_imts):
-            poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
-                                 truncation_level)
-            curves[i] *= sites.expand(
-                (1 - prob) ** poes, total_sites, placeholder=1)
-    return 1. - curves
-
-hazard_curves_task = task(hazard_curves)
+    curves = [1. - zero for zero in make_zeros(sites, imtls)]
+    with EnginePerformanceMonitor(
+            'computing hazard curves', job_id, hazard_curves):
+        for rupture in ruptures:
+            prob = rupture.get_probability_one_or_more_occurrences()
+            gsim = gsims[rupture.tectonic_region_type]
+            sctx, rctx, dctx = gsim.make_contexts(sites, rupture)
+            for i, imt in enumerate(sorted_imts):
+                poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
+                                     truncation_level)
+                curves[i] *= sites.expand(
+                    (1 - prob) ** poes, total_sites, placeholder=1)
+        return [1. - c for c in curves]
 
 
 @oqtask
-def compute_hazard_curves(job_id, sources, lt_rlz_id, ltp):
+def compute_ruptures(job_id, sources, lt_rlz_id, ltp):
     """
     Celery task for hazard curve calculator.
 
-    Samples logic trees, gathers site parameters, and calls the hazard curve
-    calculator.
+    Samples logic trees, gathers site parameters, and returns the generated
+    ruptures.
 
     :param int job_id:
         ID of the currently running job.
@@ -72,54 +74,32 @@ def compute_hazard_curves(job_id, sources, lt_rlz_id, ltp):
         Id of logic tree realization model to calculate for.
     :param ltp:
         a :class:`openquake.engine.input.LogicTreeProcessor` instance
-
-    Return a sorted array of arrays, one for each IMT.
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
-    imtls = hc.intensity_measure_types_and_levels
     lt_rlz = models.LtRealization.objects.get(id=lt_rlz_id)
     apply_uncertainties = ltp.parse_source_model_logictree_path(
         lt_rlz.sm_lt_path)
-    gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
     tom = PoissonTOM(hc.investigation_time)
-
     with EnginePerformanceMonitor(
-            'computing hazard curves', job_id,
-            compute_hazard_curves, tracing=True):
-        all_args = []
+            'computing ruptures', job_id, compute_ruptures):
         ruptures = []
         for src in map(apply_uncertainties, sources):
-            ruptures.extend(src.iter_ruptures(tom))
-        if not ruptures:
-            return make_zeros(hc.site_collection, imtls)
-        elif len(ruptures) < 1000:
-            logs.LOG.info('Generating hazard curves for %d ruptures',
-                          len(ruptures))
-            return hazard_curves(
-                ruptures, hc.site_collection, imtls, gsims,
-                hc.truncation_level)
-        all_args = [
-            (block, hc.site_collection, imtls, gsims, hc.truncation_level)
-            for block in block_splitter(ruptures, 1000)]
-        logs.LOG.info('Generating %d tasks for %d ruptures',
-                      len(all_args), len(ruptures))
-        return map_reduce(
-            hazard_curves_task, all_args,
-            lambda a, v: 1. - (1. - a) * (1. - v),
-            make_zeros(hc.site_collection, imtls))
+            # filter the source if it was not prefiltered already
+            if hc.prefiltered or hc.close_sites(src):
+                ruptures.extend(src.iter_ruptures(tom))
+        return ruptures
 
 
 def make_zeros(sites, imts):
     """
-    Returns a numpy array of I * S * L zeros, where
+    Returns a list of numpy arrays of I * S * L zeros, where
     I is the number of intensity measure types, S the number of sites
     and L the number of intensity measure levels.
 
     :params sites: the site collection
     :param imts: a dictionary of intensity measure types and levels
     """
-    return numpy.array(
-        [numpy.zeros((len(sites), len(imts[imt]))) for imt in sorted(imts)])
+    return [numpy.zeros((len(sites), len(imts[imt]))) for imt in sorted(imts)]
 
 
 class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
@@ -131,7 +111,7 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
     and GMPEs (Ground Motion Prediction Equations) from logic trees.
     """
 
-    core_calc_task = compute_hazard_curves
+    # core_calc_task = compute_hazard_curves
 
     def pre_execute(self):
         """
@@ -166,13 +146,28 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
                 task_args.append((self.job.id, block, lt_rlz.id, ltp))
 
             # the following line will print out the number of tasks generated
-            self.initialize_percent(self.core_calc_task, task_args)
+            self.initialize_percent(compute_ruptures, task_args)
 
-            zeros = make_zeros(self.hc.site_collection, imtls)
+            gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
+            ruptures = map_reduce(
+                compute_ruptures, task_args, self.agg_ruptures, [])
+
+            the_args = [(self.job.id, block, self.hc.site_collection, imtls,
+                         gsims, self.hc.truncation_level)
+                        for block in block_splitter(ruptures, 1000)]
+            del ruptures  # save memory
+            self.initialize_percent(hazard_curves, the_args)
             matrices = map_reduce(
-                self.core_calc_task, task_args, self.aggregate, zeros)
+                hazard_curves, the_args, self.aggregate,
+                make_zeros(self.hc.site_collection, imtls))
             with transaction.commit_on_success(using='job_init'):
                 self.save_curves(lt_rlz, matrices)
+
+    @EnginePerformanceMonitor.monitor
+    def agg_ruptures(self, current, new):
+        result = current + new
+        self.log_percent()
+        return result
 
     @EnginePerformanceMonitor.monitor
     def aggregate(self, current, new):
@@ -197,7 +192,7 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
             as `current`.
         :returns: the updated array
         """
-        result = 1 - (1 - current) * (1 - new)
+        result = [1 - (1 - c) * (1 - n) for c, n in zip(current, new)]
         self.log_percent()
         return result
 
