@@ -18,9 +18,9 @@ Core functionality for the classical PSHA hazard calculator.
 """
 import numpy
 
-import openquake.hazardlib
-import openquake.hazardlib.calc
 from openquake.hazardlib.imt import from_string
+from openquake.hazardlib.tom import PoissonTOM
+from openquake.hazardlib.calc import filters
 
 from openquake.engine import logs, writer
 from openquake.engine.calculators.hazard import general as haz_general
@@ -29,6 +29,39 @@ from openquake.engine.calculators.hazard.classical import (
 from openquake.engine.db import models
 from openquake.engine.utils import tasks as utils_tasks
 from openquake.engine.performance import EnginePerformanceMonitor
+
+
+def hazard_curves_poissonian(
+        sources, sites, imts, time_span, gsims, truncation_level,
+        maximum_distance):
+
+    curves = dict((imt, numpy.ones([len(sites), len(imts[imt])]))
+                  for imt in imts)
+    tom = PoissonTOM(time_span)
+
+    total_sites = len(sites)
+    for source in sources:
+        s_sites = source.filter_sites_by_distance_to_source(
+            maximum_distance, sites) if maximum_distance else sites
+        if s_sites is None:
+            continue
+        for rupture in source.iter_ruptures(tom):
+            r_sites = rupture.source_typology.\
+                filter_sites_by_distance_to_rupture(
+                    rupture, maximum_distance, s_sites
+                    ) if maximum_distance else s_sites
+            if r_sites is None:
+                continue
+            prob = rupture.get_probability_one_or_more_occurrences()
+            gsim = gsims[rupture.tectonic_region_type]
+            sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
+            for imt in imts:
+                poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
+                                     truncation_level)
+                curves[imt] *= r_sites.expand(
+                    (1. - prob) ** poes, total_sites, placeholder=1
+                )
+    return dict((imt,  1. - curves[imt]) for imt in imts)
 
 
 @utils_tasks.oqtask
@@ -65,24 +98,10 @@ def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
                    'imts': imts,
                    'sites': hc.site_collection}
 
-    if hc.maximum_distance:
-        # NB: (MS) we add a source site filter anyway, even if the sources were
-        # prefiltered, because it makes a LOT of difference: inside
-        # hazard_curves_poissonian there is a loop on the filtered sites
-        # (s_sites) and the rupture filter is applied only over such sites;
-        # look at hazardlib.calc.hazard_curve.hazard_curves_poissonian, line
-        # `for rupture, r_sites in rupture_site_filter(ruptures_sites)`
-        calc_kwargs['source_site_filter'] = (
-            openquake.hazardlib.calc.filters.source_site_distance_filter(
-                hc.maximum_distance))
-        calc_kwargs['rupture_site_filter'] = (
-            openquake.hazardlib.calc.filters.rupture_site_distance_filter(
-                hc.maximum_distance))
-
     # mapping "imt" to 2d array of hazard curves: first dimension -- sites,
     # second -- IMLs
-    curves = openquake.hazardlib.calc.hazard_curve.hazard_curves_poissonian(
-        **calc_kwargs)
+    curves = hazard_curves_poissonian(maximum_distance=hc.maximum_distance,
+                                      **calc_kwargs)
     curves_by_imt = []
     for imt in sorted(imts):
         if (curves[imt] == 0.0).all():
