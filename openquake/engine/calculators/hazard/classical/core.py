@@ -31,43 +31,45 @@ from openquake.engine.performance import EnginePerformanceMonitor
 
 
 @tasks.oqtask
-def generate_curves(job_id, source, ruptures, gsims, ordinal):
+def compute_extra_curves(job_id, source_ruptures, gsims, ordinal):
     """
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
     total_sites = len(hc.site_collection)
     imts = general.im_dict_to_hazardlib(
         hc.intensity_measure_types_and_levels)
-    s_sites = source.filter_sites_by_distance_to_source(
-        hc.maximum_distance, hc.site_collection
-    ) if hc.maximum_distance else hc.site_collection
     curves = dict((imt, numpy.ones([total_sites, len(imts[imt])]))
                   for imt in imts)
-    if s_sites is None:
-        return curves
-    for rupture in ruptures:
-        r_sites = rupture.source_typology.\
-            filter_sites_by_distance_to_rupture(
-                rupture, hc.maximum_distance, s_sites
-                ) if hc.maximum_distance else s_sites
-        if r_sites is None:
-            continue
-        prob = rupture.get_probability_one_or_more_occurrences()
-        gsim = gsims[rupture.tectonic_region_type]
-        sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
-        for imt in imts:
-            poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
-                                 hc.truncation_level)
-            curves[imt] *= r_sites.expand(
-                (1. - prob) ** poes, total_sites, placeholder=1)
-    logs.LOG.warn(
-        'Generated %d ruptures for source %s', len(ruptures), source.source_id)
+    for source, ruptures in source_ruptures:
+        s_sites = source.filter_sites_by_distance_to_source(
+            hc.maximum_distance, hc.site_collection
+        ) if hc.maximum_distance else hc.site_collection
+        if s_sites is None:
+            return curves
+        for rupture in ruptures:
+            r_sites = rupture.source_typology.\
+                filter_sites_by_distance_to_rupture(
+                    rupture, hc.maximum_distance, s_sites
+                    ) if hc.maximum_distance else s_sites
+            if r_sites is None:
+                continue
+            prob = rupture.get_probability_one_or_more_occurrences()
+            gsim = gsims[rupture.tectonic_region_type]
+            sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
+            for imt in imts:
+                poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
+                                     hc.truncation_level)
+                curves[imt] *= r_sites.expand(
+                    (1. - prob) ** poes, total_sites, placeholder=1)
+        logs.LOG.warn(
+            'Generated %d ruptures for source %s', len(ruptures),
+            source.source_id)
 
     # shortcut for filtered sources giving no contribution;
     # this is essential for performance, we want to avoid
     # returning big arrays of zeros (MS)
     return [None if (curves[imt] == 1.0).all()
-            else 1. - curves[imt] for imt in sorted(imts)], ordinal, []
+            else 1. - curves[imt] for imt in sorted(imts)], ordinal
 
 
 @tasks.oqtask
@@ -98,21 +100,27 @@ def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
     extra_args = []
     for i, source in enumerate(sources):
         ruptures = list(source.iter_ruptures(tom))
-        first_ruptures = ruptures[:100]
-        other_ruptures = ruptures[100:]
+        first_ruptures = ruptures[:500]
+        other_ruptures = ruptures[500:]
         if other_ruptures:
             extra_args.append(
-                (job_id, source, other_ruptures, gsims, lt_rlz.ordinal))
-        cs, ordinal, _extra = generate_curves.task_func(
-            job_id, source, first_ruptures, gsims, lt_rlz.ordinal)
+                (job_id, [(source, other_ruptures)], gsims, lt_rlz.ordinal))
+        cs, ordinal = compute_extra_curves.task_func(
+            job_id, [(source, first_ruptures)], gsims, lt_rlz.ordinal)
         if i == 0:  # first time
             curves = cs
         else:
-            for i, cc in enumerate(cs):
-                if cc is not None:
-                    curves[i] = 1. - (1. - curves[i]) * (1. - cc)
+            update(curves, cs)
 
     return curves, ordinal, extra_args
+
+
+def update(curves, newcurves):
+    """
+    """
+    for i, curve in enumerate(newcurves):
+        if curve is not None:
+            curves[i] = 1. - (1. - curves[i]) * (1. - curve)
 
 
 def make_zeros(realizations, sites, imtls):
@@ -164,8 +172,8 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
 
     @EnginePerformanceMonitor.monitor
     def post_execute(self):
-        print len(self.extra_args), '**************************************'
-        self.parallelize(generate_curves, self.extra_args, self.task_completed)
+        self.parallelize(compute_extra_curves, self.extra_args,
+                         self.task_completed)
         self.save_hazard_curves()
 
     @EnginePerformanceMonitor.monitor
@@ -183,12 +191,12 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
             same shape as self.curves_by_rlz[i][j] where i is the realization
             ordinal and j the IMT ordinal.
         """
-        curves_by_imt, i, extras = task_result
-        for j, matrix in enumerate(curves_by_imt):  # j is the IMT index
-            if matrix is not None:
-                self.curves_by_rlz[i][j] = 1. - (
-                    1. - self.curves_by_rlz[i][j]) * (1. - matrix)
-        self.extra_args.extend(extras)
+        if len(task_result) == 3:  # coming from compute_hazard_curves
+            curves_by_imt, i, extras = task_result
+            self.extra_args.extend(extras)
+        else:  # coming from compute_extra_curves
+            curves_by_imt, i = task_result
+        update(self.curves_by_rlz[i], curves_by_imt)
         self.log_percent(task_result)
 
     # this could be parallelized in the future, however in all the cases
