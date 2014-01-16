@@ -45,7 +45,7 @@ def compute_extra_curves(job_id, source_ruptures, gsims, ordinal):
             hc.maximum_distance, hc.site_collection
         ) if hc.maximum_distance else hc.site_collection
         if s_sites is None:
-            return [None] * len(imts), ordinal
+            return [0] * len(imts), ordinal
         for rupture in ruptures:
             r_sites = rupture.source_typology.\
                 filter_sites_by_distance_to_rupture(
@@ -68,7 +68,7 @@ def compute_extra_curves(job_id, source_ruptures, gsims, ordinal):
     # shortcut for filtered sources giving no contribution;
     # this is essential for performance, we want to avoid
     # returning big arrays of zeros (MS)
-    return [None if (curves[imt] == 1.0).all()
+    return [0 if (curves[imt] == 1.0).all()
             else 1. - curves[imt] for imt in sorted(imts)], ordinal
 
 
@@ -118,13 +118,8 @@ def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
 def update(curves, newcurves):
     """
     """
-    out = []
-    for i, curve in enumerate(newcurves):
-        if curve is not None and curves[i] is not None:
-            out.append(1. - (1. - curves[i]) * (1. - curve))
-        else:
-            out.append(curves[i])
-    return out
+    return [1. - (1. - curves[i]) * (1. - curve)
+            for i, curve in enumerate(newcurves)]
 
 
 def make_zeros(realizations, sites, imtls):
