@@ -110,7 +110,7 @@ def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
         if i == 0:  # first time
             curves = cs
         else:
-            update(curves, cs)
+            curves = update(curves, cs)
 
     return curves, ordinal, extra_args
 
@@ -118,9 +118,13 @@ def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
 def update(curves, newcurves):
     """
     """
+    out = []
     for i, curve in enumerate(newcurves):
         if curve is not None and curves[i] is not None:
-            curves[i] = 1. - (1. - curves[i]) * (1. - curve)
+            out.append(1. - (1. - curves[i]) * (1. - curve))
+        else:
+            out.append(curves[i])
+    return out
 
 
 def make_zeros(realizations, sites, imtls):
@@ -196,7 +200,7 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
             self.extra_args.extend(extras)
         else:  # coming from compute_extra_curves
             curves_by_imt, i = task_result
-        update(self.curves_by_rlz[i], curves_by_imt)
+        self.curves_by_rlz[i] = update(self.curves_by_rlz[i], curves_by_imt)
         self.log_percent(task_result)
 
     # this could be parallelized in the future, however in all the cases
