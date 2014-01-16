@@ -45,7 +45,7 @@ def compute_extra_curves(job_id, source_ruptures, gsims, ordinal):
             hc.maximum_distance, hc.site_collection
         ) if hc.maximum_distance else hc.site_collection
         if s_sites is None:
-            return curves
+            return [None] * len(imts), ordinal
         for rupture in ruptures:
             r_sites = rupture.source_typology.\
                 filter_sites_by_distance_to_rupture(
@@ -100,8 +100,8 @@ def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
     extra_args = []
     for i, source in enumerate(sources):
         ruptures = list(source.iter_ruptures(tom))
-        first_ruptures = ruptures[:500]
-        other_ruptures = ruptures[500:]
+        first_ruptures = ruptures[:200]
+        other_ruptures = ruptures[200:]
         if other_ruptures:
             extra_args.append(
                 (job_id, [(source, other_ruptures)], gsims, lt_rlz.ordinal))
@@ -119,7 +119,7 @@ def update(curves, newcurves):
     """
     """
     for i, curve in enumerate(newcurves):
-        if curve is not None:
+        if curve is not None and curves[i] is not None:
             curves[i] = 1. - (1. - curves[i]) * (1. - curve)
 
 
