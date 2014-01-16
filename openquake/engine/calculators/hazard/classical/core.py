@@ -20,51 +20,52 @@ import numpy
 
 from openquake.hazardlib.imt import from_string
 from openquake.hazardlib.tom import PoissonTOM
-from openquake.hazardlib.calc import filters
 
 from openquake.engine import logs, writer
 from openquake.engine.calculators.hazard import general as haz_general
 from openquake.engine.calculators.hazard.classical import (
     post_processing as post_proc)
 from openquake.engine.db import models
-from openquake.engine.utils import tasks as utils_tasks
+from openquake.engine.utils import tasks
 from openquake.engine.performance import EnginePerformanceMonitor
 
 
-def hazard_curves_poissonian(
-        sources, sites, imts, time_span, gsims, truncation_level,
-        maximum_distance):
-
-    curves = dict((imt, numpy.ones([len(sites), len(imts[imt])]))
+@tasks.oqtask
+def generate_curves(job_id, source, ruptures, gsims):
+    """
+    """
+    hc = models.HazardCalculation.objects.get(oqjob=job_id)
+    total_sites = len(hc.site_collection)
+    imts = haz_general.im_dict_to_hazardlib(
+        hc.intensity_measure_types_and_levels)
+    s_sites = source.filter_sites_by_distance_to_source(
+        hc.maximum_distance, hc.site_collection
+    ) if hc.maximum_distance else hc.site_collection
+    curves = dict((imt, numpy.ones([total_sites, len(imts[imt])]))
                   for imt in imts)
-    tom = PoissonTOM(time_span)
-
-    total_sites = len(sites)
-    for source in sources:
-        s_sites = source.filter_sites_by_distance_to_source(
-            maximum_distance, sites) if maximum_distance else sites
-        if s_sites is None:
+    if s_sites is None:
+        return curves
+    for rupture in ruptures:
+        r_sites = rupture.source_typology.\
+            filter_sites_by_distance_to_rupture(
+                rupture, hc.maximum_distance, s_sites
+                ) if hc.maximum_distance else s_sites
+        if r_sites is None:
             continue
-        for rupture in source.iter_ruptures(tom):
-            r_sites = rupture.source_typology.\
-                filter_sites_by_distance_to_rupture(
-                    rupture, maximum_distance, s_sites
-                    ) if maximum_distance else s_sites
-            if r_sites is None:
-                continue
-            prob = rupture.get_probability_one_or_more_occurrences()
-            gsim = gsims[rupture.tectonic_region_type]
-            sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
-            for imt in imts:
-                poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
-                                     truncation_level)
-                curves[imt] *= r_sites.expand(
-                    (1. - prob) ** poes, total_sites, placeholder=1
-                )
+        prob = rupture.get_probability_one_or_more_occurrences()
+        gsim = gsims[rupture.tectonic_region_type]
+        sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
+        for imt in imts:
+            poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
+                                 hc.truncation_level)
+            curves[imt] *= r_sites.expand(
+                (1. - prob) ** poes, total_sites, placeholder=1)
+    logs.LOG.warn(
+        'Generated %d ruptures for %s', len(ruptures), source.source_id)
     return dict((imt,  1. - curves[imt]) for imt in imts)
 
 
-@utils_tasks.oqtask
+@tasks.oqtask
 def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
     """
     Celery task for hazard curve calculator.
@@ -87,23 +88,19 @@ def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
     gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
-    imts = haz_general.im_dict_to_hazardlib(
-        hc.intensity_measure_types_and_levels)
+    tom = PoissonTOM(hc.investigation_time)
 
-    # Prepare args for the calculator.
-    calc_kwargs = {'gsims': gsims,
-                   'truncation_level': hc.truncation_level,
-                   'time_span': hc.investigation_time,
-                   'sources': sources,
-                   'imts': imts,
-                   'sites': hc.site_collection}
+    for i, source in enumerate(sources):
+        ruptures = list(source.iter_ruptures(tom))
+        cc = generate_curves.task_func(job_id, source, ruptures, gsims)
+        if i == 0:
+            curves = cc
+        else:
+            for imt in curves:
+                curves[imt] = 1. - (1. - curves[imt]) * (1. - cc[imt])
 
-    # mapping "imt" to 2d array of hazard curves: first dimension -- sites,
-    # second -- IMLs
-    curves = hazard_curves_poissonian(maximum_distance=hc.maximum_distance,
-                                      **calc_kwargs)
     curves_by_imt = []
-    for imt in sorted(imts):
+    for imt in sorted(curves):
         if (curves[imt] == 0.0).all():
             # shortcut for filtered sources giving no contribution;
             # this is essential for performance, we want to avoid
