@@ -58,7 +58,7 @@ class CeleryTaskManager(object):
                               'SUCCESS') for i, args in enumerate(arglist, 1)]
         else:
             rs = [task.delay(job_id, args, *extra) for args in arglist]
-        return ResultSet(rs)
+        return rs
 
     def initialize_progress(self, task, arglist):
         self.taskname = task.task_func.__name__
@@ -68,8 +68,8 @@ class CeleryTaskManager(object):
         logs.LOG.progress(
             'spawning %d tasks of kind %s', self.num_tasks, self.taskname)
 
-    def reduce(self, resultset, agg, acc=None):
-        for result in resultset:
+    def reduce(self, results, agg, acc=None):
+        for result in ResultSet(results):
             acc = result if acc is None else agg(acc, result)
             self.log_percent(result)
         return acc

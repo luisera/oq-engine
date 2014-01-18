@@ -119,19 +119,6 @@ def update(curves, newcurves):
             for curv, newcurv in zip(curves, newcurves)]
 
 
-def make_zeros(realizations, sites, imtls):
-    """
-    Returns a list of R lists containing I numpy arrays of S * L zeros, where
-    R is the number of realizations, I is the number of intensity measure
-    types, S the number of sites and L the number of intensity measure levels.
-
-    :params sites: the site collection
-    :param imtls: a dictionary of intensity measure types and levels
-    """
-    return [[numpy.zeros((len(sites), len(imtls[imt])))
-             for imt in sorted(imtls)] for _ in range(len(realizations))]
-
-
 class ClassicalHazardCalculator(general.BaseHazardCalculator):
     """
     Classical PSHA hazard calculator. Computes hazard curves for a given set of
@@ -163,14 +150,12 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
         logs.LOG.info('Considering %d realization(s), %d IMT(s), %d level(s) '
                       'and %d sites, total %d', n_rlz, len(self.imtls),
                       n_levels, n_sites, total)
-        self.result_set = ResultSet([])
+        self.results = []
 
     @EnginePerformanceMonitor.monitor
     def post_execute(self):
-        zeros = make_zeros(
-            self._get_realizations(), self.hc.site_collection, self.imtls)
-        ctm.initialize_progress(compute_curves, self.result_set.results)
-        self.curves_by_rlz = ctm.reduce(self.result_set, update, zeros)
+        ctm.initialize_progress(compute_curves, self.results)
+        self.curves_by_rlz = ctm.reduce(self.results, update)
         self.save_hazard_curves()
 
     @EnginePerformanceMonitor.monitor
@@ -184,9 +169,9 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
         :param task_results:
             XXX
         """
-        for task_result in task_results.results:
-            self.result_set.add(task_result)
+        self.results.extend(task_results)
         self.log_percent()
+        logs.LOG.info('Spawned %d subtasks', len(task_results))
 
     # this could be parallelized in the future, however in all the cases
     # I have seen until now, the serialized approach is fast enough (MS)
