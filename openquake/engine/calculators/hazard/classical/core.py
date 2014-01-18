@@ -16,13 +16,14 @@
 """
 Core functionality for the classical PSHA hazard calculator.
 """
-import numpy
+import operator
 
-from celery.result import ResultSet
+import numpy
 
 from openquake.hazardlib.imt import from_string
 from openquake.hazardlib.tom import PoissonTOM
 
+from openquake.engine.input import logictree
 from openquake.engine import logs, writer
 from openquake.engine.calculators.hazard import general
 from openquake.engine.calculators.hazard.classical import (
@@ -150,41 +151,31 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
         logs.LOG.info('Considering %d realization(s), %d IMT(s), %d level(s) '
                       'and %d sites, total %d', n_rlz, len(self.imtls),
                       n_levels, n_sites, total)
-        self.results = []
 
-    @EnginePerformanceMonitor.monitor
-    def post_execute(self):
-        ctm.initialize_progress(compute_curves, self.results)
-        self.curves_by_rlz = ctm.reduce(self.results, update)
-        self.save_hazard_curves()
+    def execute(self):
+        ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
+        for ltpath, rlzs in self.rlzs_per_ltpath.iteritems():
+            sources = self.sources_per_ltpath[ltpath]
+            gsim_dicts = [ltp.parse_gmpe_logictree_path(rlz.gsim_lt_path)
+                          for rlz in rlzs]
+            results = ctm.map_reduce(
+                operator.add, compute_ruptures,
+                self.job.id, sources, gsim_dicts)
+            curves = ctm.reduce(results, update)
+            self.save_hazard_curves(curves, rlzs)
 
-    @EnginePerformanceMonitor.monitor
-    def task_completed(self, task_results):
-        """
-        This is used to incrementally update hazard curve results by combining
-        an initial value with some new results. (Each set of new results is
-        computed over only a subset of seismic sources defined in the
-        calculation model.)
-
-        :param task_results:
-            XXX
-        """
-        self.results.extend(task_results)
-        self.log_percent()
-        logs.LOG.info('Spawned %d subtasks', len(task_results))
+        # logs.LOG.info('Spawned %d subtasks', len(task_results))
 
     # this could be parallelized in the future, however in all the cases
     # I have seen until now, the serialized approach is fast enough (MS)
     @EnginePerformanceMonitor.monitor
-    def save_hazard_curves(self):
+    def save_hazard_curves(self, curves, rlzs):
         """
         Post-execution actions. At the moment, all we do is finalize the hazard
         curve results.
         """
         imtls = self.hc.intensity_measure_types_and_levels
-        for i, curves_imts in enumerate(self.curves_by_rlz):
-            rlz = models.LtRealization.objects.get(
-                hazard_calculation=self.hc, ordinal=i)
+        for curves_imts, rlz in zip(curves, rlzs):
 
             # create a new `HazardCurve` 'container' record for each
             # realization (virtual container for multiple imts)
@@ -230,7 +221,6 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
                         location='POINT(%s %s)' % (p.longitude, p.latitude),
                         weight=rlz.weight)
                     for p, poes in zip(points, curves_by_imt)])
-        del self.curves_by_rlz  # save memory for the post_processing phase
 
     def post_process(self):
         """

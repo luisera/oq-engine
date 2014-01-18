@@ -69,10 +69,17 @@ class CeleryTaskManager(object):
             'spawning %d tasks of kind %s', self.num_tasks, self.taskname)
 
     def reduce(self, results, agg, acc=None):
+        """
+        """
         for result in ResultSet(results):
             acc = result if acc is None else agg(acc, result)
             self.log_percent(result)
         return acc
+
+    def map_reduce(self, agg, task, job_id, sequence, *extra):
+        """
+        """
+        return self.reduce(self.spawn(task, job_id, sequence, *extra), agg)
 
     def log_percent(self, result):
         """
