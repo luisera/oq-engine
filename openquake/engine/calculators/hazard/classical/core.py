@@ -17,6 +17,8 @@
 Core functionality for the classical PSHA hazard calculator.
 """
 import numpy
+from celery.result import EagerResult, ResultSet
+from kombu.utils import gen_unique_id
 
 from openquake.hazardlib.imt import from_string
 from openquake.hazardlib.tom import PoissonTOM
@@ -28,10 +30,11 @@ from openquake.engine.calculators.hazard.classical import (
 from openquake.engine.db import models
 from openquake.engine.utils import tasks
 from openquake.engine.performance import EnginePerformanceMonitor
+from openquake.engine.utils.general import block_splitter
 
 
 @tasks.oqtask
-def compute_extra_curves(job_id, source_ruptures, gsims, ordinal):
+def compute_curves(job_id, source_ruptures, gsims, ordinal):
     """
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
@@ -45,7 +48,7 @@ def compute_extra_curves(job_id, source_ruptures, gsims, ordinal):
             hc.maximum_distance, hc.site_collection
         ) if hc.maximum_distance else hc.site_collection
         if s_sites is None:
-            return [0] * len(imts), ordinal
+            continue
         for rupture in ruptures:
             r_sites = rupture.source_typology.\
                 filter_sites_by_distance_to_rupture(
@@ -73,7 +76,7 @@ def compute_extra_curves(job_id, source_ruptures, gsims, ordinal):
 
 
 @tasks.oqtask
-def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
+def compute_ruptures(job_id, sources, lt_rlz, ltp):
     """
     Celery task for hazard curve calculator.
 
@@ -97,22 +100,26 @@ def compute_hazard_curves(job_id, sources, lt_rlz, ltp):
     gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
     tom = PoissonTOM(hc.investigation_time)
 
-    extra_args = []
+    results = []
     for i, source in enumerate(sources):
         ruptures = list(source.iter_ruptures(tom))
         first_ruptures = ruptures[:200]
         other_ruptures = ruptures[200:]
         if other_ruptures:
-            extra_args.append(
-                (job_id, [(source, other_ruptures)], gsims, lt_rlz.ordinal))
-        cs, ordinal = compute_extra_curves.task_func(
+            for block in block_splitter(other_ruptures, 200):
+                result = compute_curves.delay(
+                    job_id, [(source, block)],
+                    gsims, lt_rlz.ordinal)
+                results.append(result)
+        cs, ordinal = compute_curves.task_func(
             job_id, [(source, first_ruptures)], gsims, lt_rlz.ordinal)
         if i == 0:  # first time
             curves = cs
         else:
             curves = update(curves, cs)
-
-    return curves, ordinal, extra_args
+    results.append(
+        EagerResult(gen_unique_id(), (curves, lt_rlz.ordinal), 'SUCCESS'))
+    return results
 
 
 def update(curves, newcurves):
@@ -144,7 +151,7 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
     and GMPEs (Ground Motion Prediction Equations) from logic trees.
     """
 
-    core_calc_task = compute_hazard_curves
+    core_calc_task = compute_ruptures
 
     def pre_execute(self):
         """
@@ -156,46 +163,41 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
         `execute` phase.).
         """
         super(ClassicalHazardCalculator, self).pre_execute()
-        imtls = self.hc.intensity_measure_types_and_levels
-        self.curves_by_rlz = make_zeros(
-            self._get_realizations(), self.hc.site_collection, imtls)
+        self.imtls = self.hc.intensity_measure_types_and_levels
         self.extra_args = []
         n_rlz = len(self._get_realizations())
-        n_levels = sum(len(lvls) for lvls in imtls.itervalues()
-                       ) / float(len(imtls))
+        n_levels = sum(len(lvls) for lvls in self.imtls.itervalues()
+                       ) / float(len(self.imtls))
         n_sites = len(self.hc.site_collection)
-        total = n_rlz * len(imtls) * n_levels * n_sites
+        total = n_rlz * len(self.imtls) * n_levels * n_sites
         logs.LOG.info('Considering %d realization(s), %d IMT(s), %d level(s) '
-                      'and %d sites, total %d', n_rlz, len(imtls), n_levels,
-                      n_sites, total)
+                      'and %d sites, total %d', n_rlz, len(self.imtls),
+                      n_levels, n_sites, total)
+        self.result_set = ResultSet([])
 
     @EnginePerformanceMonitor.monitor
     def post_execute(self):
-        self.parallelize(compute_extra_curves, self.extra_args,
-                         self.task_completed)
+        self.curves_by_rlz = make_zeros(
+            self._get_realizations(), self.hc.site_collection, self.imtls)
+        n = len(self.result_set.results)
+        for j, (curves, i) in enumerate(self.result_set, 1):
+            print '%d of %d' % (j, n)
+            self.curves_by_rlz[i] = update(self.curves_by_rlz[i], curves)
         self.save_hazard_curves()
 
     @EnginePerformanceMonitor.monitor
-    def task_completed(self, task_result):
+    def task_completed(self, task_results):
         """
         This is used to incrementally update hazard curve results by combining
         an initial value with some new results. (Each set of new results is
         computed over only a subset of seismic sources defined in the
         calculation model.)
 
-        :param task_result:
-            A triple (curves_by_imt, ordinal, extra_args) where curves_by_imt
-            is a list of 2-D numpy arrays representing the new results which
-            needs to be combined with the current value. These should be the
-            same shape as self.curves_by_rlz[i][j] where i is the realization
-            ordinal and j the IMT ordinal.
+        :param task_results:
+            XXX
         """
-        if len(task_result) == 3:  # coming from compute_hazard_curves
-            curves_by_imt, i, extras = task_result
-            self.extra_args.extend(extras)
-        else:  # coming from compute_extra_curves
-            curves_by_imt, i = task_result
-        self.curves_by_rlz[i] = update(self.curves_by_rlz[i], curves_by_imt)
+        for task_result in task_results:
+            self.result_set.add(task_result)
         self.log_percent(task_result)
 
     # this could be parallelized in the future, however in all the cases
