@@ -153,18 +153,20 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
                       n_levels, n_sites, total)
 
     def execute(self):
+        def add_results(acc, results):
+            logs.LOG.info('Spawned %d subtasks', len(results))
+            return acc + results
         ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
         for ltpath, rlzs in self.rlzs_per_ltpath.iteritems():
             sources = self.sources_per_ltpath[ltpath]
             gsim_dicts = [ltp.parse_gmpe_logictree_path(rlz.gsim_lt_path)
                           for rlz in rlzs]
             results = ctm.map_reduce(
-                operator.add, compute_ruptures,
+                add_results, compute_ruptures,
                 self.job.id, sources, gsim_dicts)
+            ctm.initialize_progress(compute_curves, results)
             curves = ctm.reduce(results, update)
             self.save_hazard_curves(curves, rlzs)
-
-        # logs.LOG.info('Spawned %d subtasks', len(task_results))
 
     # this could be parallelized in the future, however in all the cases
     # I have seen until now, the serialized approach is fast enough (MS)
