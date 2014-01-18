@@ -17,8 +17,8 @@
 Core functionality for the classical PSHA hazard calculator.
 """
 import numpy
-from celery.result import EagerResult, ResultSet
-from kombu.utils import gen_unique_id
+
+from celery.result import ResultSet
 
 from openquake.hazardlib.imt import from_string
 from openquake.hazardlib.tom import PoissonTOM
@@ -32,17 +32,19 @@ from openquake.engine.utils import tasks
 from openquake.engine.performance import EnginePerformanceMonitor
 from openquake.engine.utils.general import block_splitter
 
+ctm = tasks.CeleryTaskManager()
+
 
 @tasks.oqtask
-def compute_curves(job_id, source_ruptures, gsims, ordinal):
+def compute_curves(job_id, source_ruptures, gsim_dicts):
     """
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
     total_sites = len(hc.site_collection)
     imts = general.im_dict_to_hazardlib(
         hc.intensity_measure_types_and_levels)
-    curves = dict((imt, numpy.ones([total_sites, len(imts[imt])]))
-                  for imt in imts)
+    curves = [dict((imt, numpy.ones([total_sites, len(imts[imt])]))
+                   for imt in imts) for _ in gsim_dicts]
     for source, ruptures in source_ruptures:
         s_sites = source.filter_sites_by_distance_to_source(
             hc.maximum_distance, hc.site_collection
@@ -57,26 +59,28 @@ def compute_curves(job_id, source_ruptures, gsims, ordinal):
             if r_sites is None:
                 continue
             prob = rupture.get_probability_one_or_more_occurrences()
-            gsim = gsims[rupture.tectonic_region_type]
-            sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
-            for imt in imts:
-                poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
-                                     hc.truncation_level)
-                curves[imt] *= r_sites.expand(
-                    (1. - prob) ** poes, total_sites, placeholder=1)
-        logs.LOG.warn(
-            'Generated %d ruptures for source %s', len(ruptures),
-            source.source_id)
+            for curv, gsim_dict in zip(curves, gsim_dicts):
+                gsim = gsim_dict[rupture.tectonic_region_type]
+                sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
+                for imt in imts:
+                    poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
+                                         hc.truncation_level)
+                    curv[imt] *= r_sites.expand(
+                        (1. - prob) ** poes, total_sites, placeholder=1)
+        #logs.LOG.warn(
+        #    'Generated %d ruptures for source %s', len(ruptures),
+        #    source.source_id)
 
     # shortcut for filtered sources giving no contribution;
     # this is essential for performance, we want to avoid
     # returning big arrays of zeros (MS)
-    return [0 if (curves[imt] == 1.0).all()
-            else 1. - curves[imt] for imt in sorted(imts)], ordinal
+    return [[0 if (curv[imt] == 1.0).all()
+            else 1. - curv[imt] for imt in sorted(imts)]
+            for curv in curves]
 
 
 @tasks.oqtask
-def compute_ruptures(job_id, sources, lt_rlz, ltp):
+def compute_ruptures(job_id, sources, gsim_dicts):
     """
     Celery task for hazard curve calculator.
 
@@ -91,42 +95,28 @@ def compute_ruptures(job_id, sources, lt_rlz, ltp):
         ID of the currently running job.
     :param sources:
         List of :class:`openquake.hazardlib.source.base.SeismicSource` objects
-    :param lt_rlz:
-        a :class:`openquake.engine.db.models.LtRealization` instance
-    :param ltp:
-        a :class:`openquake.engine.input.LogicTreeProcessor` instance
+    :param gsim_dicts:
+        a list of dictionaries containing GSIM per tectonic region type
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
-    gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
     tom = PoissonTOM(hc.investigation_time)
-
-    results = []
-    for i, source in enumerate(sources):
+    source_rupts_pairs = []
+    n_ruptures = 0
+    for source in sources:
         ruptures = list(source.iter_ruptures(tom))
-        first_ruptures = ruptures[:200]
-        other_ruptures = ruptures[200:]
-        if other_ruptures:
-            for block in block_splitter(other_ruptures, 200):
-                result = compute_curves.delay(
-                    job_id, [(source, block)],
-                    gsims, lt_rlz.ordinal)
-                results.append(result)
-        cs, ordinal = compute_curves.task_func(
-            job_id, [(source, first_ruptures)], gsims, lt_rlz.ordinal)
-        if i == 0:  # first time
-            curves = cs
-        else:
-            curves = update(curves, cs)
-    results.append(
-        EagerResult(gen_unique_id(), (curves, lt_rlz.ordinal), 'SUCCESS'))
-    return results
+        n_ruptures += len(ruptures)
+        for rupts in block_splitter(ruptures, 200):
+            source_rupts_pairs.append((source, rupts))
+    logs.LOG.warn('Generated %d ruptures', n_ruptures)
+    man = tasks.CeleryTaskManager(concurrent_tasks=max(n_ruptures // 200, 1))
+    return man.spawn(compute_curves, job_id, source_rupts_pairs, gsim_dicts)
 
 
 def update(curves, newcurves):
     """
     """
-    return [1. - (1. - curves[i]) * (1. - curve)
-            for i, curve in enumerate(newcurves)]
+    return [[1. - (1. - c) * (1. - nc) for c, nc in zip(curv, newcurv)]
+            for curv, newcurv in zip(curves, newcurves)]
 
 
 def make_zeros(realizations, sites, imtls):
@@ -177,12 +167,10 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
 
     @EnginePerformanceMonitor.monitor
     def post_execute(self):
-        self.curves_by_rlz = make_zeros(
+        zeros = make_zeros(
             self._get_realizations(), self.hc.site_collection, self.imtls)
-        self.initialize_percent(compute_curves, self.result_set.results)
-        for curves, i in self.result_set:
-            self.curves_by_rlz[i] = update(self.curves_by_rlz[i], curves)
-            self.log_percent()
+        ctm.initialize_progress(compute_curves, self.result_set.results)
+        self.curves_by_rlz = ctm.reduce(self.result_set, update, zeros)
         self.save_hazard_curves()
 
     @EnginePerformanceMonitor.monitor
@@ -196,9 +184,9 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
         :param task_results:
             XXX
         """
-        for task_result in task_results:
+        for task_result in task_results.results:
             self.result_set.add(task_result)
-        self.log_percent(task_result)
+        self.log_percent()
 
     # this could be parallelized in the future, however in all the cases
     # I have seen until now, the serialized approach is fast enough (MS)

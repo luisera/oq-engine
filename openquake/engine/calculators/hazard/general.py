@@ -180,14 +180,13 @@ class BaseHazardCalculator(base.Calculator):
 
         Override this in subclasses as necessary.
         """
-        realizations = self._get_realizations()
         ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
-
-        for lt_rlz in realizations:
-            path = tuple(lt_rlz.sm_lt_path)
-            sources = self.sources_per_ltpath[path]
+        for ltpath, rlzs in self.rlzs_per_ltpath.iteritems():
+            sources = self.sources_per_ltpath[ltpath]
+            gsim_dicts = [ltp.parse_gmpe_logictree_path(rlz.gsim_lt_path)
+                          for rlz in rlzs]
             for block in self.block_split(sources):
-                yield self.job.id, block, lt_rlz, ltp
+                yield self.job.id, block, gsim_dicts
 
     def _get_realizations(self):
         """
@@ -211,6 +210,11 @@ class BaseHazardCalculator(base.Calculator):
             # this is normal in tests where everything is mocked
             logs.LOG.warn('Could not save job_stats.num_sources: %s', e)
         self.initialize_realizations()
+
+        self.rlzs_per_ltpath = collections.defaultdict(list)
+        for rlz in self._get_realizations():
+            ltpath = tuple(rlz.sm_lt_path)
+            self.rlzs_per_ltpath[ltpath].append(rlz)
 
     @EnginePerformanceMonitor.monitor
     def initialize_sources(self):

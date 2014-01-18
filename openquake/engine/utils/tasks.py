@@ -19,16 +19,74 @@
 
 """Utility functions related to splitting work into tasks."""
 
+import math
 from functools import wraps
 
 from celery.task.sets import TaskSet
+from celery.result import ResultSet, EagerResult
 from celery.task import task
 
 from openquake.engine import logs, no_distribute
 from openquake.engine.db import models
-from openquake.engine.utils import config
+from openquake.engine.utils import config, general
 from openquake.engine.writer import CacheInserter
 from openquake.engine.performance import EnginePerformanceMonitor
+
+
+class CeleryTaskManager(object):
+    MAX_BLOCK_SIZE = 1000
+
+    def __init__(self, concurrent_tasks=None, max_block_size=None):
+        self.concurrent_tasks = concurrent_tasks or \
+            int(config.get('hazard', 'concurrent_tasks'))
+        self.max_block_size = max_block_size or self.MAX_BLOCK_SIZE
+
+    def split(self, iterable):
+        items = list(iterable)
+        assert len(items) > 0, 'No items in %s' % items
+        bs_float = float(len(items)) / self.concurrent_tasks
+        bs = min(int(math.ceil(bs_float)), self.max_block_size)
+        logs.LOG.warn('Using block size=%d', bs)
+        return general.block_splitter(items, bs)
+
+    def spawn(self, task, job_id, sequence, *extra):
+        self.job_id = job_id
+        arglist = list(self.split(sequence))
+        self.initialize_progress(task, arglist)
+        if no_distribute():
+            rs = [EagerResult(str(i), task.task_func(job_id, args, *extra),
+                              'SUCCESS') for i, args in enumerate(arglist, 1)]
+        else:
+            rs = [task.delay(job_id, args, *extra) for args in arglist]
+        return ResultSet(rs)
+
+    def initialize_progress(self, task, arglist):
+        self.taskname = task.task_func.__name__
+        self.num_tasks = len(arglist)
+        self.tasksdone = 0
+        self.percent = 0.0
+        logs.LOG.progress(
+            'spawning %d tasks of kind %s', self.num_tasks, self.taskname)
+
+    def reduce(self, resultset, agg, acc=None):
+        for result in resultset:
+            acc = result if acc is None else agg(acc, result)
+            self.log_percent(result)
+        return acc
+
+    def log_percent(self, result):
+        """
+        Log the progress percentage, if changed.
+        It is called at each task completion.
+
+        :param task_result: the result of the task (often None)
+        """
+        self.tasksdone += 1
+        percent = int(float(self.tasksdone) / self.num_tasks * 100)
+        if percent > self.percent:
+            logs.LOG.progress('> %s %3d%% complete', self.taskname, percent)
+            self.percent = percent
+            # fix the progress handler on the engine server
 
 
 def map_reduce(task, task_args, agg, acc):
