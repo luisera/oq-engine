@@ -179,10 +179,10 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
     def post_execute(self):
         self.curves_by_rlz = make_zeros(
             self._get_realizations(), self.hc.site_collection, self.imtls)
-        n = len(self.result_set.results)
-        for j, (curves, i) in enumerate(self.result_set, 1):
-            print '%d of %d' % (j, n)
+        self.initialize_percent(compute_curves, self.result_set.results)
+        for curves, i in self.result_set:
             self.curves_by_rlz[i] = update(self.curves_by_rlz[i], curves)
+            self.log_percent()
         self.save_hazard_curves()
 
     @EnginePerformanceMonitor.monitor
