@@ -125,7 +125,7 @@ def compute_ruptures(job_id, sources, tom, gsim_dicts):
         # the number of generated task is governed by max_block_size
         man = tasks.CeleryTaskManager(concurrent_tasks=1, max_block_size=200)
         results.extend(
-            man.spawn_smart(
+            man.spawn(
                 compute_curves, job_id, ruptures, source, s_sites, gsim_dicts))
     return results
 
@@ -189,14 +189,9 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
             sources = self.sources_per_ltpath[ltpath]
             gsim_dicts = [ltp.parse_gmpe_logictree_path(rlz.gsim_lt_path)
                           for rlz in rlzs]
-            if self.hc.prefiltered:  # compute the ruptures sequentially
-                logs.LOG.progress('computing ruptures')
-                results = compute_ruptures.task_func(
-                    self.job.id, sources, tom, gsim_dicts)
-            else:  # compute the ruptures in parallel
-                results = ctm.map_reduce(
-                    add_results, compute_ruptures,
-                    self.job.id, sources, tom, gsim_dicts)
+            results = ctm.map_reduce(
+                add_results, compute_ruptures,
+                self.job.id, sources, tom, gsim_dicts)
             sources[:] = []  # save memory
             ctm.initialize_progress(compute_curves, results)
             curves = ctm.reduce(update, results)

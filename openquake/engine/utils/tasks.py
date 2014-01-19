@@ -84,7 +84,7 @@ class CeleryTaskManager(object):
         """
         todo = sum(1 for res in results if not res.ready())
         logs.LOG.progress(
-            'spawning %d tasks of kind %s', todo, self.taskname)
+            'spawning %d tasks of kind %s', todo or 1, self.taskname)
         for result in ResultSet(results):
             acc = result if acc is None else agg(acc, result)
             self.log_percent(result)
@@ -93,7 +93,7 @@ class CeleryTaskManager(object):
     def map_reduce(self, agg, task, job_id, sequence, *extra):
         """
         """
-        results = self.spawn(task, job_id, sequence, *extra)
+        results = self.spawn_smart(task, job_id, sequence, *extra)
         self.initialize_progress(task, results)
         return self.reduce(agg, results)
 
