@@ -43,7 +43,7 @@ ctm = tasks.CeleryTaskManager()
 
 
 @tasks.oqtask
-def compute_curves(job_id, ruptures, source, s_sites, gsim_dicts):
+def compute_curves(job_id, rss, gsim_dicts):
     """
     This task computes R2 * I hazard curves (each one is a
     numpy array of S * L floats) from the given source_ruptures
@@ -62,22 +62,23 @@ def compute_curves(job_id, ruptures, source, s_sites, gsim_dicts):
         hc.intensity_measure_types_and_levels)
     curves = [dict((imt, numpy.ones([total_sites, len(imts[imt])]))
                    for imt in imts) for _ in gsim_dicts]
-    for rupture in ruptures:
-        r_sites = rupture.source_typology.\
-            filter_sites_by_distance_to_rupture(
-                rupture, hc.maximum_distance, s_sites
-                ) if hc.maximum_distance else s_sites
-        if r_sites is None:
-            continue
-        prob = rupture.get_probability_one_or_more_occurrences()
-        for curv, gsim_dict in zip(curves, gsim_dicts):
-            gsim = gsim_dict[rupture.tectonic_region_type]
-            sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
-            for imt in imts:
-                poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
-                                     hc.truncation_level)
-                curv[imt] *= r_sites.expand(
-                    (1. - prob) ** poes, total_sites, placeholder=1)
+    for ruptures, source, s_sites in rss:
+        for rupture in ruptures:
+            r_sites = rupture.source_typology.\
+                filter_sites_by_distance_to_rupture(
+                    rupture, hc.maximum_distance, s_sites
+                    ) if hc.maximum_distance else s_sites
+            if r_sites is None:
+                continue
+            prob = rupture.get_probability_one_or_more_occurrences()
+            for curv, gsim_dict in zip(curves, gsim_dicts):
+                gsim = gsim_dict[rupture.tectonic_region_type]
+                sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
+                for imt in imts:
+                    poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
+                                         hc.truncation_level)
+                    curv[imt] *= r_sites.expand(
+                        (1. - prob) ** poes, total_sites, placeholder=1)
     # shortcut for filtered sources giving no contribution;
     # this is essential for performance, we want to avoid
     # returning big arrays of zeros (MS)
@@ -111,7 +112,7 @@ def compute_ruptures(job_id, sources, tom, gsim_dicts):
     # be filtered only once in compute_curves
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
     n_ruptures = 0
-    results = []
+    rss = []
     for source in sources:
         s_sites = source.filter_sites_by_distance_to_source(
             hc.maximum_distance, hc.site_collection
@@ -119,15 +120,15 @@ def compute_ruptures(job_id, sources, tom, gsim_dicts):
         if s_sites is None:
             continue
         ruptures = list(source.iter_ruptures(tom))
+        if not ruptures:
+            continue
         n_ruptures += len(ruptures)
         logs.LOG.debug('Generated %d ruptures for source %s',
                        n_ruptures, source.source_id)
-        # the number of generated task is governed by max_block_size
-        man = tasks.CeleryTaskManager(concurrent_tasks=1, max_block_size=200)
-        results.extend(
-            man.spawn(
-                compute_curves, job_id, ruptures, source, s_sites, gsim_dicts))
-    return results
+        rss.append((ruptures, source, s_sites))
+    # the number of generated task is governed by max_block_size
+    man = tasks.CeleryTaskManager(concurrent_tasks=2)
+    return man.spawn(compute_curves, job_id, rss, gsim_dicts)
 
 
 def update(curves, newcurves):

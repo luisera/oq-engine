@@ -57,7 +57,7 @@ class CeleryTaskManager(object):
 
     def spawn(self, task, job_id, sequence, *extra):
         self.job_id = job_id
-        if no_distribute():
+        if no_distribute() or not sequence:
             rs = [self.run(task, job_id, sequence, *extra)]
         else:
             rs = [task.delay(job_id, seq, *extra)
