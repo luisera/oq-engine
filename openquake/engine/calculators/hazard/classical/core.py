@@ -37,7 +37,6 @@ from openquake.engine.calculators.hazard.classical import (
 from openquake.engine.db import models
 from openquake.engine.utils import tasks
 from openquake.engine.performance import EnginePerformanceMonitor
-from openquake.engine.utils.general import block_splitter
 
 ctm = tasks.CeleryTaskManager()
 
@@ -112,7 +111,7 @@ def compute_ruptures(job_id, sources, tom, gsim_dicts):
     # be filtered only once in compute_curves
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
     n_ruptures = 0
-    rss = []
+    collector = tasks.ItemCollector(1000)
     for source in sources:
         s_sites = source.filter_sites_by_distance_to_source(
             hc.maximum_distance, hc.site_collection
@@ -125,11 +124,10 @@ def compute_ruptures(job_id, sources, tom, gsim_dicts):
         n_ruptures += len(ruptures)
         logs.LOG.debug('Generated %d ruptures for source %s',
                        n_ruptures, source.source_id)
-        for block in block_splitter(ruptures, 1000):
-            rss.append((block, source, s_sites))
-    # the number of generated task is governed by max_block_size
-    man = tasks.CeleryTaskManager(concurrent_tasks=1)
-    return man.spawn(compute_curves, job_id, rss, gsim_dicts)
+        collector.add((ruptures, source, s_sites), len(ruptures))
+    print collector.len_weights(), len(collector.collect())
+    return [compute_curves.delay(job_id, rss, gsim_dicts)
+            for rss in collector.collect()]
 
 
 def update(curves, newcurves):

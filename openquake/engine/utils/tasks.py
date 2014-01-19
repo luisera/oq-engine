@@ -34,6 +34,49 @@ from openquake.engine.writer import CacheInserter
 from openquake.engine.performance import EnginePerformanceMonitor
 
 
+class WeightedSequence(object):
+    def __init__(self):
+        self.seq = []
+        self.weight = 0
+
+    def add(self, item, weight):
+        self.seq.append(item)
+        self.weight += weight
+
+    def __cmp__(self, other):
+        return -cmp(self.weight, other.weight)
+
+
+class ItemCollector(object):
+    def __init__(self, max_weight):
+        self.sequences = [WeightedSequence()]
+        self.max_weight = max_weight
+
+    def add(self, item, weight):
+        seq = self.sequences[-1]
+        if seq.weight + weight > self.max_weight:
+            ws = WeightedSequence()
+            ws.add(item, weight)
+            self.sequences.append(ws)
+        else:
+            seq.add(item, weight)
+
+    def collect(self):
+        return [ws.seq for ws in sorted(self.sequences)]
+
+    def len_weights(self):
+        return [(len(ws.seq), ws.weight) for ws in sorted(self.sequences)]
+
+    def num_items(self):
+        return sum(len(ws.seq) for ws in self.sequences)
+
+    def tot_weight(self):
+        return sum(ws.weight for ws in self.sequences)
+
+    def reset(self):
+        self.sequences = []
+
+
 class CeleryTaskManager(object):
     MAX_BLOCK_SIZE = 1000
 
