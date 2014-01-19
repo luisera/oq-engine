@@ -101,6 +101,9 @@ def compute_ruptures(job_id, sources, gsim_dicts):
     tom = PoissonTOM(hc.investigation_time)
     source_rupts_pairs = []
     n_ruptures = 0
+    if not hc.prefiltered:
+        sources = (src for src in sources
+                   if hc.sites_affected_by(src) is not None)
     for source in sources:
         ruptures = list(source.iter_ruptures(tom))
         n_ruptures += len(ruptures)
@@ -156,18 +159,24 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
 
     def execute(self):
         ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
-        n_sites = len(self.hc.site_collection)
+        n_models = len(self.rlzs_per_ltpath)
+        n = 1
         for ltpath, rlzs in self.rlzs_per_ltpath.iteritems():
+            logs.LOG.progress('source model path %s, %d of %d',
+                              '_'.join(ltpath), n, n_models)
+            n += 1
             sources = self.sources_per_ltpath[ltpath]
             gsim_dicts = [ltp.parse_gmpe_logictree_path(rlz.gsim_lt_path)
                           for rlz in rlzs]
-            if n_sites > 1000:  # compute and filter the ruptures in parallel
+            logs.LOG.progress('computing ruptures')
+            if self.hc.prefiltered:  # compute the ruptures sequentially
+                results = compute_ruptures.task_func(
+                    self.job.id, sources, gsim_dicts)
+            else:  # compute the ruptures in parallel
                 results = ctm.map_reduce(
                     add_results, compute_ruptures,
                     self.job.id, sources, gsim_dicts)
-            else:  # compute and filter all the ruptures using a single core
-                results = compute_ruptures.task_func(
-                    self.job.id, sources, gsim_dicts)
+            sources[:] = []  # save memory
             ctm.initialize_progress(compute_curves, results)
             curves = ctm.reduce(results, update)
             self.save_hazard_curves(curves, rlzs)

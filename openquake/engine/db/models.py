@@ -48,7 +48,7 @@ from openquake.engine.db import fields
 from openquake.engine import writer
 
 # source prefiltering is enabled for #sites <= FILTERING_THRESHOLD
-FILTERING_THRESHOLD = 10000
+FILTERING_THRESHOLD = 1000
 
 #: Kind of supported curve statistics
 STAT_CHOICES = (

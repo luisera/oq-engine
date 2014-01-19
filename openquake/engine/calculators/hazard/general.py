@@ -239,7 +239,7 @@ class BaseHazardCalculator(base.Calculator):
             self.sources_per_ltpath[smpath] = sources = list(
                 source.parse_source_model_smart(
                     os.path.join(self.hc.base_path, sm),
-                    lambda src: True,
+                    self.hc.sites_affected_by,
                     self.smlt.make_apply_uncertainties(path),
                     self.hc.rupture_mesh_spacing,
                     self.hc.width_of_mfd_bin,
