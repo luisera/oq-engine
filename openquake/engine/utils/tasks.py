@@ -46,13 +46,12 @@ class CeleryTaskManager(object):
         assert len(items) > 0, 'No items in %s' % items
         bs_float = float(len(items)) / self.concurrent_tasks
         bs = min(int(math.ceil(bs_float)), self.max_block_size)
-        logs.LOG.warn('Using block size=%d', bs)
+        logs.LOG.debug('Using block size=%d', bs)
         return general.block_splitter(items, bs)
 
     def spawn(self, task, job_id, sequence, *extra):
         self.job_id = job_id
         arglist = list(self.split(sequence))
-        self.initialize_progress(task, arglist)
         if no_distribute():
             rs = [EagerResult(str(i), task.task_func(job_id, args, *extra),
                               'SUCCESS') for i, args in enumerate(arglist, 1)]

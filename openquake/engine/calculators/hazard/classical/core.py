@@ -16,8 +16,6 @@
 """
 Core functionality for the classical PSHA hazard calculator.
 """
-import operator
-
 import numpy
 
 from openquake.hazardlib.imt import from_string
@@ -108,7 +106,7 @@ def compute_ruptures(job_id, sources, gsim_dicts):
         n_ruptures += len(ruptures)
         for rupts in block_splitter(ruptures, 200):
             source_rupts_pairs.append((source, rupts))
-    logs.LOG.warn('Generated %d ruptures', n_ruptures)
+    logs.LOG.debug('Generated %d ruptures', n_ruptures)
     man = tasks.CeleryTaskManager(concurrent_tasks=max(n_ruptures // 200, 1))
     return man.spawn(compute_curves, job_id, source_rupts_pairs, gsim_dicts)
 
@@ -118,6 +116,11 @@ def update(curves, newcurves):
     """
     return [[1. - (1. - c) * (1. - nc) for c, nc in zip(curv, newcurv)]
             for curv, newcurv in zip(curves, newcurves)]
+
+
+def add_results(acc, results):
+    logs.LOG.debug('Spawned %d subtasks', len(results))
+    return acc + results
 
 
 class ClassicalHazardCalculator(general.BaseHazardCalculator):
@@ -142,7 +145,6 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
         """
         super(ClassicalHazardCalculator, self).pre_execute()
         self.imtls = self.hc.intensity_measure_types_and_levels
-        self.extra_args = []
         n_rlz = len(self._get_realizations())
         n_levels = sum(len(lvls) for lvls in self.imtls.itervalues()
                        ) / float(len(self.imtls))
@@ -153,17 +155,19 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
                       n_levels, n_sites, total)
 
     def execute(self):
-        def add_results(acc, results):
-            logs.LOG.info('Spawned %d subtasks', len(results))
-            return acc + results
         ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
+        n_sites = len(self.hc.site_collection)
         for ltpath, rlzs in self.rlzs_per_ltpath.iteritems():
             sources = self.sources_per_ltpath[ltpath]
             gsim_dicts = [ltp.parse_gmpe_logictree_path(rlz.gsim_lt_path)
                           for rlz in rlzs]
-            results = ctm.map_reduce(
-                add_results, compute_ruptures,
-                self.job.id, sources, gsim_dicts)
+            if n_sites > 1000:  # compute and filter the ruptures in parallel
+                results = ctm.map_reduce(
+                    add_results, compute_ruptures,
+                    self.job.id, sources, gsim_dicts)
+            else:  # compute and filter all the ruptures using a single core
+                results = compute_ruptures.task_func(
+                    self.job.id, sources, gsim_dicts)
             ctm.initialize_progress(compute_curves, results)
             curves = ctm.reduce(results, update)
             self.save_hazard_curves(curves, rlzs)
