@@ -22,6 +22,7 @@
 import math
 from functools import wraps
 
+from kombu.utils import gen_unique_id
 from celery.task.sets import TaskSet
 from celery.result import ResultSet, EagerResult
 from celery.task import task
@@ -49,12 +50,17 @@ class CeleryTaskManager(object):
         logs.LOG.debug('Using block size=%d', bs)
         return general.block_splitter(items, bs)
 
+    def run(self, task, job_id, sequence, *extra):
+        return EagerResult(
+            gen_unique_id(),
+            task.task_func(job_id, sequence, *extra), 'SUCCESS')
+
     def spawn(self, task, job_id, sequence, *extra):
         self.job_id = job_id
         arglist = list(self.split(sequence))
         if no_distribute():
-            rs = [EagerResult(str(i), task.task_func(job_id, args, *extra),
-                              'SUCCESS') for i, args in enumerate(arglist, 1)]
+            rs = [self.run(task, job_id, args, *extra)
+                  for i, args in enumerate(arglist, 1)]
         else:
             rs = [task.delay(job_id, args, *extra) for args in arglist]
         return rs
