@@ -123,11 +123,11 @@ def compute_ruptures(job_id, sources, gsim_dicts):
     # to generate here more ruptures than need rather than
     # to filter; they will be removed later
     if not hc.prefiltered:
-        sources = [
+        sources = (
             src for src in sources if
             src.filter_sites_by_distance_to_source(
                 hc.maximum_distance, hc.site_collection)
-            is not None]
+            is not None)
     for source in sources:
         ruptures = list(source.iter_ruptures(tom))
         n_ruptures += len(ruptures)
@@ -135,7 +135,7 @@ def compute_ruptures(job_id, sources, gsim_dicts):
             source_rupts_pairs.append((source, rupts))
     logs.LOG.debug('Generated %d ruptures', n_ruptures)
     man = tasks.CeleryTaskManager(concurrent_tasks=max(n_ruptures // 200, 1))
-    if n_ruptures <= 200:
+    if n_ruptures <= 2000:
         return [man.run(compute_curves,
                         job_id, source_rupts_pairs, gsim_dicts)]
     return man.spawn(compute_curves, job_id, source_rupts_pairs, gsim_dicts)
