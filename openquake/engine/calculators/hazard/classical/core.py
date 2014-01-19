@@ -116,7 +116,7 @@ def compute_ruptures(job_id, sources, tom, gsim_dicts):
     for source in sources:
         s_sites = source.filter_sites_by_distance_to_source(
             hc.maximum_distance, hc.site_collection
-        )
+        ) if hc.maximum_distance else hc.site_collection
         if s_sites is None:
             continue
         ruptures = list(source.iter_ruptures(tom))
@@ -125,9 +125,10 @@ def compute_ruptures(job_id, sources, tom, gsim_dicts):
         n_ruptures += len(ruptures)
         logs.LOG.debug('Generated %d ruptures for source %s',
                        n_ruptures, source.source_id)
-        rss.append((ruptures, source, s_sites))
+        for block in block_splitter(ruptures, 1000):
+            rss.append((block, source, s_sites))
     # the number of generated task is governed by max_block_size
-    man = tasks.CeleryTaskManager(concurrent_tasks=2)
+    man = tasks.CeleryTaskManager(concurrent_tasks=1)
     return man.spawn(compute_curves, job_id, rss, gsim_dicts)
 
 
