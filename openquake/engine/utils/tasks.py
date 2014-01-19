@@ -57,12 +57,20 @@ class CeleryTaskManager(object):
 
     def spawn(self, task, job_id, sequence, *extra):
         self.job_id = job_id
-        arglist = list(self.split(sequence))
         if no_distribute():
-            rs = [self.run(task, job_id, args, *extra)
-                  for i, args in enumerate(arglist, 1)]
+            rs = [self.run(task, job_id, sequence, *extra)]
         else:
-            rs = [task.delay(job_id, args, *extra) for args in arglist]
+            rs = [task.delay(job_id, seq, *extra)
+                  for seq in self.split(sequence)]
+        return rs
+
+    def spawn_smart(self, task, job_id, sequence, *extra):
+        self.job_id = job_id
+        if no_distribute() or len(sequence) <= self.max_block_size:
+            rs = [self.run(task, job_id, sequence, *extra)]
+        else:
+            rs = [task.delay(job_id, seq, *extra)
+                  for seq in self.split(sequence)]
         return rs
 
     def initialize_progress(self, task, arglist):
@@ -70,12 +78,13 @@ class CeleryTaskManager(object):
         self.num_tasks = len(arglist)
         self.tasksdone = 0
         self.percent = 0.0
-        logs.LOG.progress(
-            'spawning %d tasks of kind %s', self.num_tasks, self.taskname)
 
-    def reduce(self, results, agg, acc=None):
+    def reduce(self, agg, results, acc=None):
         """
         """
+        todo = sum(1 for res in results if not res.ready())
+        logs.LOG.progress(
+            'spawning %d tasks of kind %s', todo, self.taskname)
         for result in ResultSet(results):
             acc = result if acc is None else agg(acc, result)
             self.log_percent(result)
@@ -86,7 +95,7 @@ class CeleryTaskManager(object):
         """
         results = self.spawn(task, job_id, sequence, *extra)
         self.initialize_progress(task, results)
-        return self.reduce(results, agg)
+        return self.reduce(agg, results)
 
     def log_percent(self, result):
         """

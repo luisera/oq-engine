@@ -43,7 +43,7 @@ ctm = tasks.CeleryTaskManager()
 
 
 @tasks.oqtask
-def compute_curves(job_id, source_ruptures, gsim_dicts):
+def compute_curves(job_id, ruptures, source, s_sites, gsim_dicts):
     """
     This task computes R2 * I hazard curves (each one is a
     numpy array of S * L floats) from the given source_ruptures
@@ -62,28 +62,22 @@ def compute_curves(job_id, source_ruptures, gsim_dicts):
         hc.intensity_measure_types_and_levels)
     curves = [dict((imt, numpy.ones([total_sites, len(imts[imt])]))
                    for imt in imts) for _ in gsim_dicts]
-    for source, ruptures in source_ruptures:
-        s_sites = source.filter_sites_by_distance_to_source(
-            hc.maximum_distance, hc.site_collection
-        ) if hc.maximum_distance else hc.site_collection
-        if s_sites is None:
+    for rupture in ruptures:
+        r_sites = rupture.source_typology.\
+            filter_sites_by_distance_to_rupture(
+                rupture, hc.maximum_distance, s_sites
+                ) if hc.maximum_distance else s_sites
+        if r_sites is None:
             continue
-        for rupture in ruptures:
-            r_sites = rupture.source_typology.\
-                filter_sites_by_distance_to_rupture(
-                    rupture, hc.maximum_distance, s_sites
-                    ) if hc.maximum_distance else s_sites
-            if r_sites is None:
-                continue
-            prob = rupture.get_probability_one_or_more_occurrences()
-            for curv, gsim_dict in zip(curves, gsim_dicts):
-                gsim = gsim_dict[rupture.tectonic_region_type]
-                sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
-                for imt in imts:
-                    poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
-                                         hc.truncation_level)
-                    curv[imt] *= r_sites.expand(
-                        (1. - prob) ** poes, total_sites, placeholder=1)
+        prob = rupture.get_probability_one_or_more_occurrences()
+        for curv, gsim_dict in zip(curves, gsim_dicts):
+            gsim = gsim_dict[rupture.tectonic_region_type]
+            sctx, rctx, dctx = gsim.make_contexts(r_sites, rupture)
+            for imt in imts:
+                poes = gsim.get_poes(sctx, rctx, dctx, imt, imts[imt],
+                                     hc.truncation_level)
+                curv[imt] *= r_sites.expand(
+                    (1. - prob) ** poes, total_sites, placeholder=1)
     # shortcut for filtered sources giving no contribution;
     # this is essential for performance, we want to avoid
     # returning big arrays of zeros (MS)
@@ -93,7 +87,7 @@ def compute_curves(job_id, source_ruptures, gsim_dicts):
 
 
 @tasks.oqtask
-def compute_ruptures(job_id, sources, gsim_dicts):
+def compute_ruptures(job_id, sources, tom, gsim_dicts):
     """
     Celery task for hazard curve calculator.
 
@@ -112,33 +106,28 @@ def compute_ruptures(job_id, sources, gsim_dicts):
         a list of dictionaries containing GSIM per tectonic region type,
         one for each GMPE realization
     """
+    # NB: rupture generation is faster than filtering if there are many sites,
+    # this is why here we do not filter at all; the ruptures in excess will
+    # be filtered only once in compute_curves
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
-    tom = PoissonTOM(hc.investigation_time)
-    source_rupts_pairs = []
     n_ruptures = 0
-    # if the sources have not been prefiltered, they
-    # will be filtered in compute_curves: notice that
-    # filtering is more expensive than generating the
-    # ruptures, if there are lots of points, so it is best
-    # to generate here more ruptures than need rather than
-    # to filter; they will be removed later
-    if not hc.prefiltered:
-        sources = (
-            src for src in sources if
-            src.filter_sites_by_distance_to_source(
-                hc.maximum_distance, hc.site_collection)
-            is not None)
+    results = []
     for source in sources:
+        s_sites = source.filter_sites_by_distance_to_source(
+            hc.maximum_distance, hc.site_collection
+        )
+        if s_sites is None:
+            continue
         ruptures = list(source.iter_ruptures(tom))
         n_ruptures += len(ruptures)
-        for rupts in block_splitter(ruptures, 200):
-            source_rupts_pairs.append((source, rupts))
-    logs.LOG.debug('Generated %d ruptures', n_ruptures)
-    man = tasks.CeleryTaskManager(concurrent_tasks=max(n_ruptures // 200, 1))
-    if n_ruptures <= 2000:
-        return [man.run(compute_curves,
-                        job_id, source_rupts_pairs, gsim_dicts)]
-    return man.spawn(compute_curves, job_id, source_rupts_pairs, gsim_dicts)
+        logs.LOG.debug('Generated %d ruptures for source %s',
+                       n_ruptures, source.source_id)
+        # the number of generated task is governed by max_block_size
+        man = tasks.CeleryTaskManager(concurrent_tasks=1, max_block_size=200)
+        results.extend(
+            man.spawn_smart(
+                compute_curves, job_id, ruptures, source, s_sites, gsim_dicts))
+    return results
 
 
 def update(curves, newcurves):
@@ -189,6 +178,7 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
                       n_levels, n_sites, total)
 
     def execute(self):
+        tom = PoissonTOM(self.hc.investigation_time)
         ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
         n_models = len(self.rlzs_per_ltpath)
         n = 1
@@ -202,14 +192,14 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
             if self.hc.prefiltered:  # compute the ruptures sequentially
                 logs.LOG.progress('computing ruptures')
                 results = compute_ruptures.task_func(
-                    self.job.id, sources, gsim_dicts)
+                    self.job.id, sources, tom, gsim_dicts)
             else:  # compute the ruptures in parallel
                 results = ctm.map_reduce(
                     add_results, compute_ruptures,
-                    self.job.id, sources, gsim_dicts)
+                    self.job.id, sources, tom, gsim_dicts)
             sources[:] = []  # save memory
             ctm.initialize_progress(compute_curves, results)
-            curves = ctm.reduce(results, update)
+            curves = ctm.reduce(update, results)
             self.save_hazard_curves(curves, rlzs)
 
     # this could be parallelized in the future, however in all the cases
