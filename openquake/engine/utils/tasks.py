@@ -84,7 +84,9 @@ class CeleryTaskManager(object):
     def map_reduce(self, agg, task, job_id, sequence, *extra):
         """
         """
-        return self.reduce(self.spawn(task, job_id, sequence, *extra), agg)
+        results = self.spawn(task, job_id, sequence, *extra)
+        self.initialize_progress(task, results)
+        return self.reduce(results, agg)
 
     def log_percent(self, result):
         """
