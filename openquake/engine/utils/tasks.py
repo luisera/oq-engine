@@ -35,6 +35,9 @@ from openquake.engine.performance import EnginePerformanceMonitor
 
 
 class WeightedSequence(object):
+    """
+    A sequence [(item, weight), ...] with an ordering by reverse weight.
+    """
     def __init__(self):
         self.seq = []
         self.weight = 0
@@ -44,6 +47,7 @@ class WeightedSequence(object):
         self.weight += weight
 
     def __cmp__(self, other):
+        """Ensure ordering by reverse weight"""
         return -cmp(self.weight, other.weight)
 
 
@@ -77,7 +81,7 @@ class ItemCollector(object):
         self.sequences = []
 
 
-class CeleryTaskManager(object):
+class OqTaskManager(object):
     MAX_BLOCK_SIZE = 1000
 
     def __init__(self, concurrent_tasks=None, max_block_size=None):
@@ -99,6 +103,9 @@ class CeleryTaskManager(object):
             task.task_func(job_id, sequence, *extra), 'SUCCESS')
 
     def spawn(self, task, job_id, sequence, *extra):
+        """
+        Spawn a set of subtasks
+        """
         self.job_id = job_id
         if no_distribute() or not sequence:
             rs = [self.run(task, job_id, sequence, *extra)]
@@ -108,6 +115,10 @@ class CeleryTaskManager(object):
         return rs
 
     def spawn_smart(self, task, job_id, sequence, *extra):
+        """
+        If the sequence is shorter than the max_block_size
+        runs it sequentially in process.
+        """
         self.job_id = job_id
         if no_distribute() or len(sequence) <= self.max_block_size:
             rs = [self.run(task, job_id, sequence, *extra)]
@@ -117,6 +128,13 @@ class CeleryTaskManager(object):
         return rs
 
     def initialize_progress(self, task, arglist):
+        """
+        Initialize the attributes for the progress report.
+        Must be called before the .log_percent method.
+
+        :param task: a celery task object
+        :param arglist: a list of object with num_tasks elements
+        """
         self.taskname = task.task_func.__name__
         self.num_tasks = len(arglist)
         self.tasksdone = 0
@@ -124,6 +142,13 @@ class CeleryTaskManager(object):
 
     def reduce(self, agg, results, acc=None):
         """
+        Reduce the list of result objects with the aggregation operator
+
+        :param agg: a bilinear operator agg(acc, item) -> new_acc
+        :param results: a list of celery AsyncResult objects
+        :param acc: the original value of the accumulator
+
+        If `acc` is None the first result is used as starting point
         """
         todo = sum(1 for res in results if not res.ready())
         logs.LOG.progress(
@@ -139,6 +164,18 @@ class CeleryTaskManager(object):
         results = self.spawn_smart(task, job_id, sequence, *extra)
         self.initialize_progress(task, results)
         return self.reduce(agg, results)
+
+    def map_reduce_seq(self, agg, task, job_id, sequence, *extra):
+        """
+        """
+        acc = None
+        sequences = list(self.split(sequence))
+        self.initialize_progress(task, sequences)
+        for seq in sequences:
+            res = task.task_func(job_id, seq, **extra)
+            acc = res if acc is None else agg(acc, res)
+            self.log_percent(res)
+        return acc
 
     def log_percent(self, result):
         """

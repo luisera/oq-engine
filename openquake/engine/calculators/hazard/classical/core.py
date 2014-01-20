@@ -38,7 +38,7 @@ from openquake.engine.db import models
 from openquake.engine.utils import tasks
 from openquake.engine.performance import EnginePerformanceMonitor
 
-ctm = tasks.CeleryTaskManager()
+oqman = tasks.OqTaskManager()
 
 
 @tasks.oqtask
@@ -113,19 +113,22 @@ def compute_ruptures(job_id, sources, tom, gsim_dicts):
     n_ruptures = 0
     collector = tasks.ItemCollector(1000)
     for source in sources:
-        s_sites = source.filter_sites_by_distance_to_source(
-            hc.maximum_distance, hc.site_collection
-        ) if hc.maximum_distance else hc.site_collection
-        if s_sites is None:
-            continue
-        ruptures = list(source.iter_ruptures(tom))
+        with EnginePerformanceMonitor(
+                'filter sources', job_id, compute_ruptures):
+            s_sites = source.filter_sites_by_distance_to_source(
+                hc.maximum_distance, hc.site_collection
+            ) if hc.maximum_distance else hc.site_collection
+            if s_sites is None:
+                continue
+        with EnginePerformanceMonitor(
+                'iter_ruptures', job_id, compute_ruptures):
+            ruptures = list(source.iter_ruptures(tom))
         if not ruptures:
             continue
         n_ruptures += len(ruptures)
         logs.LOG.debug('Generated %d ruptures for source %s',
                        n_ruptures, source.source_id)
         collector.add((ruptures, source, s_sites), len(ruptures))
-    print collector.len_weights(), len(collector.collect())
     return [compute_curves.delay(job_id, rss, gsim_dicts)
             for rss in collector.collect()]
 
@@ -134,7 +137,7 @@ def update(curves, newcurves):
     """
     Compose the hazard curves returned by compute_curves.
 
-    :param curves: a list of lists of R * I numpy arrays
+    :param curves: a list of lists of R2 * I numpy arrays
     :param newcurves: same as curves
     """
     return [[1. - (1. - c) * (1. - nc) for c, nc in zip(curv, newcurv)]
@@ -189,17 +192,18 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
             sources = self.sources_per_ltpath[ltpath]
             gsim_dicts = [ltp.parse_gmpe_logictree_path(rlz.gsim_lt_path)
                           for rlz in rlzs]
-            results = ctm.map_reduce(
+            results = oqman.map_reduce(
                 add_results, compute_ruptures,
                 self.job.id, sources, tom, gsim_dicts)
-            sources[:] = []  # save memory
-            ctm.initialize_progress(compute_curves, results)
-            curves = ctm.reduce(update, results)
-            self.save_hazard_curves(curves, rlzs)
+            sources[:] = []  # to save memory
+            with self.monitor('reducing curves'):
+                oqman.initialize_progress(compute_curves, results)
+                curves = oqman.reduce(update, results)
+            with self.monitor('saving curves'):
+                self.save_hazard_curves(curves, rlzs)
 
     # this could be parallelized in the future, however in all the cases
     # I have seen until now, the serialized approach is fast enough (MS)
-    @EnginePerformanceMonitor.monitor
     def save_hazard_curves(self, curves, rlzs):
         """
         Post-execution actions. At the moment, all we do is finalize the hazard
