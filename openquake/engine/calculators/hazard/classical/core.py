@@ -85,9 +85,9 @@ def compute_curves(job_id, sources, tom, gsim_dicts):
                                          hc.truncation_level)
                     curv[imt] *= r_sites.expand(
                         (1. - prob) ** poes, total_sites, placeholder=1)
-    # shortcut for filtered sources giving no contribution;
-    # this is essential for performance, we want to avoid
-    # returning big arrays of zeros (MS)
+    # the 0 here is a shortcut for filtered sources giving no contribution;
+    # this is essential for performance, we want to avoid returning
+    # big arrays of zeros (MS)
     return [[0 if (curv[imt] == 1.0).all()
             else 1. - curv[imt] for imt in sorted(imts)]
             for curv in curves]
@@ -144,7 +144,7 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
         """
         hc = self.hc
         collector = oqman.collector(
-            1000, compute_curves, self.job.id, tom, gsim_dicts)
+            1000, compute_curves, self.job.id, sources, tom, gsim_dicts)
         for source in sources:
             with self.monitor('filter sources'):
                 s_sites = source.filter_sites_by_distance_to_source(
@@ -174,9 +174,9 @@ class ClassicalHazardCalculator(general.BaseHazardCalculator):
             logs.LOG.progress('computing ruptures')
             results = self.compute_ruptures(sources, tom, gsim_dicts)
             sources[:] = []  # to save memory
-            with self.monitor('computing curves'):
-                oqman.initialize_progress(compute_curves, results)
-                curves = oqman.reduce(update, results)
+
+            oqman.initialize_progress(compute_curves, results)
+            curves = oqman.reduce(update, results)
             with self.monitor('saving curves'):
                 self.save_hazard_curves(curves, rlzs)
 

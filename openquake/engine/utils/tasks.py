@@ -90,11 +90,20 @@ class OqTaskManager(object):
             int(config.get('hazard', 'concurrent_tasks'))
         self.max_block_size = max_block_size or self.MAX_BLOCK_SIZE
 
-    def collector(self, max_weight, task, job_id, *extra):
+    def collector(self, max_weight, task, job_id, sequence, *extra):
         self.job_id = job_id
         self.extra = extra
-        return _ItemCollector(
-            max_weight, lambda seq: task.delay(job_id, seq, *extra))
+        self.num_items = len(sequence)
+        self.done = 0
+
+        def callback(seq):
+            result = task.delay(job_id, seq, *extra)
+            self.done += len(seq)
+            logs.LOG.progress(
+                'processed %d of %d items', self.done, self.num_items)
+            return result
+
+        return _ItemCollector(max_weight, callback)
 
     def split(self, iterable):
         items = list(iterable)
