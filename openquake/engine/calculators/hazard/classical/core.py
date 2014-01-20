@@ -56,19 +56,21 @@ def compute_curves(job_id, sources, tom, gsim_dicts):
         a list of gsim dictionaries, one for each GMPE realization
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
+    return _compute_curves(hc, sources, tom, gsim_dicts)
+
+
+def _compute_curves(hc, sources, tom, gsim_dicts):
     total_sites = len(hc.site_collection)
     imts = general.im_dict_to_hazardlib(
         hc.intensity_measure_types_and_levels)
     curves = [dict((imt, numpy.ones([total_sites, len(imts[imt])]))
                    for imt in imts) for _ in gsim_dicts]
     for source in sources:
-        with EnginePerformanceMonitor(
-                'filter sources', job_id, compute_curves):
-            s_sites = source.filter_sites_by_distance_to_source(
-                hc.maximum_distance, hc.site_collection
-            ) if hc.maximum_distance else hc.site_collection
-            if s_sites is None:
-                continue
+        s_sites = source.filter_sites_by_distance_to_source(
+            hc.maximum_distance, hc.site_collection
+        ) if hc.maximum_distance else hc.site_collection
+        if s_sites is None:
+            continue
         for rupture in source.iter_ruptures(tom):
             r_sites = rupture.source_typology.\
                 filter_sites_by_distance_to_rupture(

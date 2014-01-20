@@ -26,7 +26,6 @@ from openquake.engine.calculators.hazard.classical.core import \
     ClassicalHazardCalculator
 from openquake.engine.db import models
 from openquake.engine.input import logictree
-from openquake.engine.utils import general as general_utils
 from openquake.engine.utils import tasks as utils_tasks
 from openquake.engine.performance import EnginePerformanceMonitor
 
