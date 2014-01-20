@@ -34,15 +34,16 @@ from openquake.engine.writer import CacheInserter
 from openquake.engine.performance import EnginePerformanceMonitor
 
 
-class WeightedSequence(object):
+class _WeightedSequence(object):
     """
-    A sequence [(item, weight), ...] with an ordering by reverse weight.
+    A wrapper over a sequence of weighted items with a total weight
     """
     def __init__(self):
         self.seq = []
         self.weight = 0
 
     def add(self, item, weight):
+        "Add an item to the sequence and increments the weight"
         self.seq.append(item)
         self.weight += weight
 
@@ -51,34 +52,34 @@ class WeightedSequence(object):
         return -cmp(self.weight, other.weight)
 
 
-class ItemCollector(object):
-    def __init__(self, max_weight):
-        self.sequences = [WeightedSequence()]
+class _ItemCollector(object):
+    """
+    Collects weighted items in sequences with total weight smaller
+    than the max_weight, with the exception of single-item sequences.
+    """
+    def __init__(self, max_weight, callback):
+        self.ws = _WeightedSequence()
         self.max_weight = max_weight
+        self.callback = callback
+        self._results = []
 
-    def add(self, item, weight):
-        seq = self.sequences[-1]
-        if seq.weight + weight > self.max_weight:
-            ws = WeightedSequence()
+    def add(self, item, weight=1):
+        if weight <= 0:  # ignore items with zero weight
+            return
+        if self.ws.weight + weight > self.max_weight:
+            ws = _WeightedSequence()
             ws.add(item, weight)
-            self.sequences.append(ws)
+            res = self.callback(self.ws.seq)
+            self._results.append(res)
+            self.ws = ws
         else:
-            seq.add(item, weight)
+            self.ws.add(item, weight)
 
-    def collect(self):
-        return [ws.seq for ws in sorted(self.sequences)]
-
-    def len_weights(self):
-        return [(len(ws.seq), ws.weight) for ws in sorted(self.sequences)]
-
-    def num_items(self):
-        return sum(len(ws.seq) for ws in self.sequences)
-
-    def tot_weight(self):
-        return sum(ws.weight for ws in self.sequences)
-
-    def reset(self):
-        self.sequences = []
+    @property
+    def results(self):
+        if self.ws.seq:
+            self._results.append(self.callback(self.ws.seq))
+        return self._results
 
 
 class OqTaskManager(object):
@@ -88,6 +89,12 @@ class OqTaskManager(object):
         self.concurrent_tasks = concurrent_tasks or \
             int(config.get('hazard', 'concurrent_tasks'))
         self.max_block_size = max_block_size or self.MAX_BLOCK_SIZE
+
+    def collector(self, max_weight, task, job_id, *extra):
+        self.job_id = job_id
+        self.extra = extra
+        return _ItemCollector(
+            max_weight, lambda seq: task.delay(job_id, seq, *extra))
 
     def split(self, iterable):
         items = list(iterable)
@@ -172,7 +179,7 @@ class OqTaskManager(object):
         sequences = list(self.split(sequence))
         self.initialize_progress(task, sequences)
         for seq in sequences:
-            res = task.task_func(job_id, seq, **extra)
+            res = task.task_func(job_id, seq, *extra)
             acc = res if acc is None else agg(acc, res)
             self.log_percent(res)
         return acc
